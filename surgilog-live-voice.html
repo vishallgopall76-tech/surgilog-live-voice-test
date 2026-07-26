@@ -201,13 +201,17 @@ async function startSession() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = async function() {
+    // 2026-07-26: inputAudioTranscription/outputAudioTranscription were added speculatively (for
+    // on-screen transcript text) but were never actually confirmed against real documentation —
+    // given the token endpoint already rejected one undocumented field, these are the prime suspect
+    // for the immediate disconnect. Stripped back to exactly Google's own confirmed-working example
+    // (model + responseModalities + systemInstruction only). Transcript text can come back once the
+    // core connection is confirmed stable.
     var setupMessage = {
       config: {
         model: 'models/' + MODEL,
         responseModalities: ['AUDIO'],
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        inputAudioTranscription: {},
-        outputAudioTranscription: {}
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
       }
     };
     ws.send(JSON.stringify(setupMessage));
@@ -264,8 +268,17 @@ async function startSession() {
     showError('Connection error. Your voice token may have expired (they only last a few minutes) — tap Start again.');
     endSession();
   };
-  ws.onclose = function() {
-    if (sessionActive) { setStatus('Disconnected', 'The session ended', null); endSession(); }
+  ws.onclose = function(event) {
+    // 2026-07-26 FIX: this used to call setStatus() with a "Disconnected" message that endSession()
+    // (called on the very next line) immediately overwrote with "Ready" before anyone could read it —
+    // making every failure look like nothing happened at all, a 1-second flash back to idle. Now shows
+    // the real WebSocket close code/reason as a persistent error instead, which also means we can
+    // actually see WHY it closed (e.g. code 1008 usually means the server rejected something in the
+    // setup message) rather than guessing blind.
+    if (sessionActive) {
+      showError('Voice session closed (code ' + event.code + (event.reason ? ': ' + event.reason : '') + '). If this keeps happening, tap Start again for a fresh token — they expire quickly.');
+      endSession();
+    }
   };
 }
 
