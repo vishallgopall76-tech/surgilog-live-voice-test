@@ -201,16 +201,21 @@ async function startSession() {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = async function() {
-    // 2026-07-26: inputAudioTranscription/outputAudioTranscription were added speculatively (for
-    // on-screen transcript text) but were never actually confirmed against real documentation —
-    // given the token endpoint already rejected one undocumented field, these are the prime suspect
-    // for the immediate disconnect. Stripped back to exactly Google's own confirmed-working example
-    // (model + responseModalities + systemInstruction only). Transcript text can come back once the
-    // core connection is confirmed stable.
+    // 2026-07-26 FIX: confirmed against the authoritative schema at ai.google.dev/api/live (the
+    // low-level field-by-field reference, not just the getting-started example, which turned out to
+    // be simplified/inconsistent in two ways):
+    //   1. The top-level wrapper key must be "setup", not "config" — matches the exact error we got
+    //      back: Unknown name "config": Cannot find field.
+    //   2. responseModalities lives inside a nested "generationConfig" object, not as a sibling of
+    //      "model" and "systemInstruction".
+    // inputAudioTranscription/outputAudioTranscription ARE real, valid fields per this same
+    // reference (unlike the token endpoint's liveConnectConstraints, which genuinely doesn't exist)
+    // — left out for now on purpose, to isolate whether this structural fix alone gets the core
+    // connection working before adding anything back.
     var setupMessage = {
-      config: {
+      setup: {
         model: 'models/' + MODEL,
-        responseModalities: ['AUDIO'],
+        generationConfig: { responseModalities: ['AUDIO'] },
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
       }
     };
