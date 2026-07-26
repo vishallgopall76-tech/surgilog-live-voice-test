@@ -67,6 +67,11 @@
     <div class="error-box" id="errorBox"></div>
   </div>
 
+  <div class="transcript" id="debugPanel" style="margin-bottom:16px; display:none;">
+    <div class="transcript-label">Diagnostics</div>
+    <div id="debugBody" style="font-size:12px; color:#4a5568; line-height:1.7;"></div>
+  </div>
+
   <div class="transcript">
     <div class="transcript-label">Transcript</div>
     <div id="transcriptBody"><div class="empty">Nothing said yet</div></div>
@@ -74,6 +79,18 @@
 </div>
 
 <script>
+// Real counters instead of guessing — shows exactly which stage of the pipeline is actually
+// running: mic capturing, chunks reaching the server, and anything at all coming back.
+var debugStats = { chunksSent: 0, bytesSent: 0, messagesReceived: 0, lastMessageType: 'none', wsState: '-' };
+function renderDebug() {
+  document.getElementById('debugPanel').style.display = 'block';
+  document.getElementById('debugBody').innerHTML =
+    'WebSocket state: ' + debugStats.wsState + '<br>' +
+    'Audio chunks sent: ' + debugStats.chunksSent + ' (' + debugStats.bytesSent + ' bytes total)<br>' +
+    'Messages received from server: ' + debugStats.messagesReceived + '<br>' +
+    'Last message type: ' + debugStats.lastMessageType;
+}
+
 // ---------- Config passed in from SurgiLog ----------
 var params = new URLSearchParams(window.location.search);
 var LIVE_TOKEN = params.get('token') || '';
@@ -228,6 +245,8 @@ async function startSession() {
       document.getElementById('mainBtn').disabled = false;
       var rateNote = (captureCtx.sampleRate !== 16000) ? ' (mic ran at ' + captureCtx.sampleRate + 'Hz, resampled to 16kHz)' : '';
       setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening');
+      debugStats.wsState = 'OPEN';
+      renderDebug();
     } catch (audioErr) {
       showError('Connected, but audio setup failed: ' + audioErr.message);
       document.getElementById('mainBtn').disabled = false;
@@ -237,6 +256,9 @@ async function startSession() {
   ws.onmessage = function(event) {
     var response;
     try { response = JSON.parse(event.data); } catch (e) { return; }
+    debugStats.messagesReceived++;
+    debugStats.lastMessageType = Object.keys(response).join(',') || 'empty';
+    renderDebug();
     if (response.setupComplete) return;
     if (response.serverContent) {
       var sc = response.serverContent;
@@ -319,11 +341,19 @@ async function setupAudioPipeline() {
   // connection that stays "Listening…" with no error and no reply. Now actually resamples to true
   // 16kHz before sending, whatever the real captured rate turns out to be.
   captureNode.port.onmessage = function(e) {
-    if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) {
+      debugStats.wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'null';
+      renderDebug();
+      return;
+    }
     var resampled = resampleTo16k_(e.data, captureCtx.sampleRate);
     var pcm = floatTo16BitPCM(resampled);
     var b64 = arrayBufferToBase64(pcm);
     ws.send(JSON.stringify({ realtimeInput: { audio: { data: b64, mimeType: 'audio/pcm;rate=16000' } } }));
+    debugStats.chunksSent++;
+    debugStats.bytesSent += pcm.byteLength;
+    debugStats.wsState = 'OPEN';
+    if (debugStats.chunksSent % 20 === 0) renderDebug(); // don't hammer the DOM every ~8ms chunk
   };
   var micSource = captureCtx.createMediaStreamSource(micStream);
   micSource.connect(captureNode);
