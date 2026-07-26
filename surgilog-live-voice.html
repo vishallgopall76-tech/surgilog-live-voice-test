@@ -254,8 +254,29 @@ async function startSession() {
   };
 
   ws.onmessage = function(event) {
+    // 2026-07-26 FIX: event.data can be a string (text frame) OR a Blob (binary frame) — the old
+    // code only ever tried JSON.parse(event.data) directly, which throws immediately on a Blob and
+    // was silently swallowed by the catch block. That would perfectly explain audio going out fine
+    // (1260 chunks sent, connection healthy) while messagesReceived stayed frozen at 0 — every
+    // incoming message may have been silently dropped before we ever looked at it. Now handles both
+    // frame types, and shows a parse failure on screen instead of hiding it.
+    if (event.data instanceof Blob) {
+      event.data.text().then(handleServerMessage).catch(function(e) {
+        debugStats.lastMessageType = 'BLOB READ ERROR: ' + e.message;
+        renderDebug();
+      });
+    } else {
+      handleServerMessage(event.data);
+    }
+  };
+  function handleServerMessage(raw) {
     var response;
-    try { response = JSON.parse(event.data); } catch (e) { return; }
+    try { response = JSON.parse(raw); } catch (e) {
+      debugStats.messagesReceived++;
+      debugStats.lastMessageType = 'PARSE FAILED: ' + e.message;
+      renderDebug();
+      return;
+    }
     debugStats.messagesReceived++;
     debugStats.lastMessageType = Object.keys(response).join(',') || 'empty';
     renderDebug();
