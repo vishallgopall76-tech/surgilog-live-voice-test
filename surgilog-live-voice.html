@@ -54,15 +54,15 @@
 <body>
 <div class="wrap">
   <div class="header">
-    <div class="tag">SurgiLog · v3.68</div>
+    <div class="tag">SurgiLog · v3.80</div>
     <h1>🎙️ Live Voice</h1>
     <p>Talk naturally — the Secretary will respond out loud.</p>
   </div>
 
   <div class="stage">
     <div class="orb" id="orb">🎙️</div>
-    <div class="status" id="status">Ready</div>
-    <div class="substatus" id="substatus">Tap to start a live conversation</div>
+    <div class="status" id="status">Connecting…</div>
+    <div class="substatus" id="substatus">Starting automatically…</div>
     <button class="btn btn-start" id="mainBtn" onclick="toggleSession()">Start Conversation</button>
     <div class="error-box" id="errorBox"></div>
   </div>
@@ -409,6 +409,18 @@ function endSession() {
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
+
+// 2026-07-26: auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap —
+// matching how Claude's own Voice Mode works (tap once, immediately listening), not a wake word
+// (which nothing web-based can do — see the chat this came from). If the browser blocks the
+// auto-triggered microphone request (iOS can be strict about requiring a direct tap on THIS page,
+// not just the one that opened it), startSession() already falls back gracefully to a normal
+// tappable "Start Conversation" button via its own existing error handling — never a stuck page.
+if (LIVE_TOKEN) {
+  startSession();
+} else {
+  setStatus('Ready', 'No voice token found — open this page from the SurgiLog Secretary, not directly.', null);
+}
 </script>
 </body>
 </html>
