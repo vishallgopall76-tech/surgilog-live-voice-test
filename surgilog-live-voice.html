@@ -281,7 +281,11 @@ async function startSession() {
     // actually see WHY it closed (e.g. code 1008 usually means the server rejected something in the
     // setup message) rather than guessing blind.
     if (sessionActive) {
-      showError('Voice session closed (code ' + event.code + (event.reason ? ': ' + event.reason : '') + '). If this keeps happening, tap Start again for a fresh token — they expire quickly.');
+      var reason = event.reason || '';
+      var friendly = (reason.indexOf('used too many times') >= 0)
+        ? 'This voice link has been used up. Go back to SurgiLog and tap "Live Voice Conversation" again for a fresh one.'
+        : 'Voice session closed (code ' + event.code + (reason ? ': ' + reason : '') + '). If this keeps happening, go back to SurgiLog and tap "Live Voice Conversation" again for a fresh token.';
+      showError(friendly);
       endSession();
     }
   };
