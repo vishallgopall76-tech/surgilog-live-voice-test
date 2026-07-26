@@ -226,7 +226,8 @@ async function startSession() {
       document.getElementById('mainBtn').textContent = 'End Conversation';
       document.getElementById('mainBtn').className = 'btn btn-end';
       document.getElementById('mainBtn').disabled = false;
-      setStatus('Listening…', 'Just talk naturally', 'listening');
+      var rateNote = (captureCtx.sampleRate !== 16000) ? ' (mic ran at ' + captureCtx.sampleRate + 'Hz, resampled to 16kHz)' : '';
+      setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening');
     } catch (audioErr) {
       showError('Connected, but audio setup failed: ' + audioErr.message);
       document.getElementById('mainBtn').disabled = false;
@@ -291,14 +292,36 @@ async function startSession() {
   };
 }
 
+function resampleTo16k_(float32Array, fromRate) {
+  if (fromRate === 16000) return float32Array;
+  var ratio = fromRate / 16000;
+  var newLength = Math.round(float32Array.length / ratio);
+  var result = new Float32Array(newLength);
+  for (var i = 0; i < newLength; i++) {
+    var srcIndex = i * ratio;
+    var srcFloor = Math.floor(srcIndex);
+    var srcCeil = Math.min(srcFloor + 1, float32Array.length - 1);
+    var frac = srcIndex - srcFloor;
+    result[i] = float32Array[srcFloor] * (1 - frac) + float32Array[srcCeil] * frac;
+  }
+  return result;
+}
+
 async function setupAudioPipeline() {
   // Capture: mic -> 16kHz PCM16 -> base64 -> sent to Gemini
   captureCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
   await captureCtx.audioWorklet.addModule(blobUrlFor(CAPTURE_WORKLET_SRC));
   captureNode = new AudioWorkletNode(captureCtx, 'capture-processor');
+  // 2026-07-26 FIX: { sampleRate: 16000 } is only a REQUEST — iOS Safari in particular can silently
+  // substitute the device's own hardware rate (often 48000) instead, with no error or warning. If
+  // that happened here, every previous chunk was labeled 16kHz but wasn't actually — garbled audio
+  // Gemini could open a stable connection to but never usefully understand, which matches a
+  // connection that stays "Listening…" with no error and no reply. Now actually resamples to true
+  // 16kHz before sending, whatever the real captured rate turns out to be.
   captureNode.port.onmessage = function(e) {
     if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) return;
-    var pcm = floatTo16BitPCM(e.data);
+    var resampled = resampleTo16k_(e.data, captureCtx.sampleRate);
+    var pcm = floatTo16BitPCM(resampled);
     var b64 = arrayBufferToBase64(pcm);
     ws.send(JSON.stringify({ realtimeInput: { audio: { data: b64, mimeType: 'audio/pcm;rate=16000' } } }));
   };
