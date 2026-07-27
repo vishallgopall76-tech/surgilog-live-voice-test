@@ -444,20 +444,38 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
+  // 2026-07-27 FIX #2 ("have to tap End Conversation twice"): endSession() (below) always resets
+  // the button back to enabled, "Start Conversation" — correct for a normal end-of-session, but
+  // here we're leaving the page entirely, and navigation is never instant (a real network round
+  // trip to RETURN_URL, not an instant same-tab swap). For that gap, the button sat there reading
+  // "Start Conversation" again — indistinguishable from the tap never having registered. That's
+  // what invited a second tap: either re-starting a fresh session on a page already mid-navigation-
+  // away, or re-tapping the same spot right as the real navigation finally kicked in. Locking the
+  // button immediately, before anything else runs, means the very first tap always visibly commits
+  // to leaving — never a moment that looks like nothing happened.
+  var btn = document.getElementById('mainBtn');
+  btn.disabled = true;
+  btn.textContent = 'Ending…';
+  setStatus('Ending…', 'Returning to SurgiLog', null);
+
   // 2026-07-27 FIX: a single unguarded throw inside endSession() (the micStream cleanup line, now
-  // fixed) was silently aborting this ENTIRE function before it ever reached the navigation below —
-  // exactly what produced the "tap End Conversation, nothing happens, tap it again, now it asks for
-  // mic access like a fresh start" sequence. Wrapping the call itself too, as a second layer —
-  // navigation should never again depend on every single cleanup step succeeding perfectly.
+  // fixed) was silently aborting this ENTIRE function before it ever reached the navigation below.
+  // Wrapping the call itself too, as a second layer — navigation should never again depend on every
+  // single cleanup step succeeding perfectly. endSession() still resets the button text/enabled
+  // state as part of its own normal cleanup, but that's harmless now — the lines above already ran,
+  // nothing reads the button again before navigating, and we're leaving this page regardless.
   try { endSession(); } catch (e) {}
+
   // 2026-07-27: window.close() was tried first here, but proved unreliable across several real
   // tests — sometimes leaving a genuinely blank Safari tab instead of either closing or returning
   // anywhere, on this specific browser. Plain navigation is a far more dependable browser operation
   // than the tab-close permission model, so this now navigates straight back to the exact SurgiLog
   // URL it was opened from, if that was passed through. This replaces this tab's content with
   // SurgiLog itself, rather than depending on Safari to correctly switch back to a different tab.
+  // location.replace() (not .href): this tab's own "Connecting…"/live-voice history entry is of no
+  // further use once we've left, so don't leave it sitting there as a back-button trap.
   if (RETURN_URL) {
-    location.href = RETURN_URL;
+    location.replace(RETURN_URL);
     return;
   }
   // No return URL available (e.g. an old link without it, or opened directly). Not attempting
