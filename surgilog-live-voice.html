@@ -96,6 +96,7 @@ var params = new URLSearchParams(window.location.search);
 var LIVE_TOKEN = params.get('token') || '';
 var MODEL = params.get('model') || 'gemini-3.1-flash-live-preview';
 var SYSTEM_PROMPT = params.get('prompt') || "You are a helpful assistant.";
+var RETURN_URL = params.get('returnUrl') || '';
 
 var ws = null;
 var micStream = null;
@@ -434,16 +435,19 @@ function endSession() {
 
 function endConversationAndReturn() {
   endSession();
-  // 2026-07-27: tapping End Conversation was only resetting this page's own state, leaving the tab
-  // itself open with no way back to SurgiLog except the browser's own tab switcher — worse than it
-  // should be. This tab was opened via window.open() from SurgiLog's own script, so it's allowed to
-  // close itself; this should take the user straight back automatically.
+  // 2026-07-27: window.close() was tried first here, but proved unreliable across several real
+  // tests — sometimes leaving a genuinely blank Safari tab instead of either closing or returning
+  // anywhere, on this specific browser. Plain navigation is a far more dependable browser operation
+  // than the tab-close permission model, so this now navigates straight back to the exact SurgiLog
+  // URL it was opened from, if that was passed through. This replaces this tab's content with
+  // SurgiLog itself, rather than depending on Safari to correctly switch back to a different tab.
+  if (RETURN_URL) {
+    location.href = RETURN_URL;
+    return;
+  }
+  // No return URL available (e.g. an old link without it, or opened directly) — fall back to the
+  // previous approach, with the same guaranteed-visible fallback state either way.
   try { window.close(); } catch (e) {}
-  // 2026-07-27: if window.close() doesn't actually take (browser declines it, for whatever reason —
-  // this has genuinely been seen, not just theoretical), endSession() above should already leave a
-  // normal "Ready to start" screen — but to guarantee it, explicitly re-confirm that state after a
-  // beat, with an unmistakable message, rather than leaving anything to chance about what's on
-  // screen at this point.
   setTimeout(function() {
     setStatus('Conversation ended', 'You can close this tab, or tap below to talk again', null);
   }, 400);
