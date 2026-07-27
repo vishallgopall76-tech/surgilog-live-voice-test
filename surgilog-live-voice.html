@@ -134,6 +134,10 @@ function addTranscriptLine(speaker, text) {
   div.id = 'live-' + speaker;
   div.textContent = text;
   body.appendChild(div);
+  // 2026-07-27: cap how many finalized lines stay in the DOM — a much smaller contributor than the
+  // base64 fix above, but the same underlying principle: unbounded growth over a long conversation
+  // adds up. Keeps roughly the most recent 100 lines, which is already far more than fits on screen.
+  while (body.children.length > 100) { body.removeChild(body.firstChild); }
   body.scrollTop = body.scrollHeight;
 }
 function finalizeTranscriptLine(speaker) {
@@ -183,9 +187,14 @@ function floatTo16BitPCM(float32Array) {
   return out.buffer;
 }
 function arrayBufferToBase64(buffer) {
+  // 2026-07-27 FIX: was building this string one character at a time in a loop — for a chunk this
+  // small (~256 bytes) that's not the bottleneck on its own, but this runs ~125 times/second for the
+  // entire conversation, so it adds up to millions of small string allocations over several minutes.
+  // Real, measurable CPU/memory churn on top of everything else running concurrently (WebSocket,
+  // audio worklets, DOM updates) — plausibly part of what pushes memory pressure high enough for iOS
+  // to kill the page's process on a longer conversation. Bulk conversion in one call instead.
   var bytes = new Uint8Array(buffer);
-  var binary = '';
-  for (var i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  var binary = String.fromCharCode.apply(null, bytes);
   return window.btoa(binary);
 }
 function base64ToFloat32(base64) {
@@ -423,7 +432,7 @@ function endSession() {
   sessionActive = false;
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-  if (micStream) { micStream.getTracks().forEach(function(t){ t.stop(); }); micStream = null; }
+  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
   if (captureCtx) { try { captureCtx.close(); } catch (e) {} captureCtx = null; captureNode = null; }
   if (playbackCtx) { try { playbackCtx.close(); } catch (e) {} playbackCtx = null; playbackNode = null; }
   document.getElementById('mainBtn').textContent = 'Start Conversation';
@@ -435,7 +444,12 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
-  endSession();
+  // 2026-07-27 FIX: a single unguarded throw inside endSession() (the micStream cleanup line, now
+  // fixed) was silently aborting this ENTIRE function before it ever reached the navigation below —
+  // exactly what produced the "tap End Conversation, nothing happens, tap it again, now it asks for
+  // mic access like a fresh start" sequence. Wrapping the call itself too, as a second layer —
+  // navigation should never again depend on every single cleanup step succeeding perfectly.
+  try { endSession(); } catch (e) {}
   // 2026-07-27: window.close() was tried first here, but proved unreliable across several real
   // tests — sometimes leaving a genuinely blank Safari tab instead of either closing or returning
   // anywhere, on this specific browser. Plain navigation is a far more dependable browser operation
