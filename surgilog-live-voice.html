@@ -103,6 +103,7 @@ var captureCtx = null, captureNode = null;
 var playbackCtx = null, playbackNode = null;
 var sessionActive = false;
 var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
+var wakeLock = null; // keeps the screen from auto-locking during an active conversation — best-effort only
 var currentUserLine = "", currentSecretaryLine = "";
 
 function setStatus(text, sub, mode) {
@@ -197,7 +198,7 @@ function base64ToFloat32(base64) {
 
 // ---------- Main session control ----------
 function toggleSession() {
-  if (sessionActive) { endSession(); } else { startSession(); }
+  if (sessionActive) { endConversationAndReturn(); } else { startSession(); }
 }
 
 async function startSession() {
@@ -206,6 +207,15 @@ async function startSession() {
   if (!LIVE_TOKEN) { showError('No voice token was passed in. Open this page from the SurgiLog Secretary, not directly.'); return; }
   document.getElementById('mainBtn').disabled = true;
   setStatus('Connecting…', 'Setting up microphone and connection', null);
+  // 2026-07-27: can't keep the conversation running with the screen fully OFF — iOS suspends both
+  // the WebSocket and the microphone the instant the screen locks, a real platform restriction, not
+  // something fixable here. This is the honest next-best thing: stop the screen from auto-locking
+  // WHILE a conversation is active, so at least it won't cut out just from sitting untouched for a
+  // few seconds. Not supported on every browser, and best-effort even where it is — never treated
+  // as required for the conversation itself to work.
+  try {
+    if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+  } catch (e) { wakeLock = null; }
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
@@ -409,6 +419,7 @@ function playAudioChunk(base64Audio) {
 
 function endSession() {
   sessionActive = false;
+  if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   if (ws) { try { ws.close(); } catch (e) {} ws = null; }
   if (micStream) { micStream.getTracks().forEach(function(t){ t.stop(); }); micStream = null; }
   if (captureCtx) { try { captureCtx.close(); } catch (e) {} captureCtx = null; captureNode = null; }
@@ -419,6 +430,23 @@ function endSession() {
   if (!document.getElementById('errorBox').style.display || document.getElementById('errorBox').style.display === 'none') {
     setStatus('Ready', 'Tap to start a live conversation', null);
   }
+}
+
+function endConversationAndReturn() {
+  endSession();
+  // 2026-07-27: tapping End Conversation was only resetting this page's own state, leaving the tab
+  // itself open with no way back to SurgiLog except the browser's own tab switcher — worse than it
+  // should be. This tab was opened via window.open() from SurgiLog's own script, so it's allowed to
+  // close itself; this should take the user straight back automatically.
+  try { window.close(); } catch (e) {}
+  // 2026-07-27: if window.close() doesn't actually take (browser declines it, for whatever reason —
+  // this has genuinely been seen, not just theoretical), endSession() above should already leave a
+  // normal "Ready to start" screen — but to guarantee it, explicitly re-confirm that state after a
+  // beat, with an unmistakable message, rather than leaving anything to chance about what's on
+  // screen at this point.
+  setTimeout(function() {
+    setStatus('Conversation ended', 'You can close this tab, or tap below to talk again', null);
+  }, 400);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
