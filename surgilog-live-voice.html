@@ -102,6 +102,7 @@ var micStream = null;
 var captureCtx = null, captureNode = null;
 var playbackCtx = null, playbackNode = null;
 var sessionActive = false;
+var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
 var currentUserLine = "", currentSecretaryLine = "";
 
 function setStatus(text, sub, mode) {
@@ -201,6 +202,7 @@ function toggleSession() {
 
 async function startSession() {
   clearError();
+  isAiSpeaking = false;
   if (!LIVE_TOKEN) { showError('No voice token was passed in. Open this page from the SurgiLog Secretary, not directly.'); return; }
   document.getElementById('mainBtn').disabled = true;
   setStatus('Connecting…', 'Setting up microphone and connection', null);
@@ -286,6 +288,14 @@ async function startSession() {
       if (sc.modelTurn && sc.modelTurn.parts) {
         sc.modelTurn.parts.forEach(function(part) {
           if (part.inlineData && part.inlineData.data) {
+            // 2026-07-27 FIX: browser echoCancellation is only a best-effort hint, and it doesn't
+            // reliably track audio played back through the raw Web Audio API the way it tracks a
+            // normal <audio> element — this page's own speech was getting picked back up by the
+            // mic and misread as user speech (and even triggering the API's own "interrupted"
+            // handling on its own echoed voice). Suppressing outgoing mic audio while the
+            // Secretary's own reply is actively playing removes that path at the source, instead
+            // of hoping the browser's AEC catches it.
+            isAiSpeaking = true;
             playAudioChunk(part.inlineData.data);
             setStatus('Speaking…', 'The Secretary is replying', 'speaking');
           }
@@ -300,11 +310,13 @@ async function startSession() {
         addTranscriptLine('secretary', currentSecretaryLine);
       }
       if (sc.turnComplete) {
+        isAiSpeaking = false;
         finalizeTranscriptLine('user'); finalizeTranscriptLine('secretary');
         currentUserLine = ""; currentSecretaryLine = "";
         setStatus('Listening…', 'Just talk naturally', 'listening');
       }
       if (sc.interrupted) {
+        isAiSpeaking = false;
         if (playbackNode) playbackNode.port.postMessage('interrupt');
       }
     }
@@ -367,6 +379,7 @@ async function setupAudioPipeline() {
       renderDebug();
       return;
     }
+    if (isAiSpeaking) return; // don't send while the Secretary's own reply is playing — prevents it hearing itself
     var resampled = resampleTo16k_(e.data, captureCtx.sampleRate);
     var pcm = floatTo16BitPCM(resampled);
     var b64 = arrayBufferToBase64(pcm);
