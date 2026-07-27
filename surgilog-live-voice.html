@@ -55,6 +55,7 @@
 <div class="wrap">
   <div class="header">
     <div class="tag" style="cursor:pointer; text-decoration:underline;" onclick="endConversationAndReturn()">&larr; Return to SurgiLog</div>
+    <div style="font-size:11px; color:#8ca3c9; margin-top:4px;">This opened in a new tab — your SurgiLog tab is still open behind it. If tapping above doesn't return you automatically, just switch tabs (swipe up, or tap your open-tabs button) — no need to close this one.</div>
     <h1>🎙️ Live Voice</h1>
     <p>Talk naturally — the Secretary will respond out loud.</p>
   </div>
@@ -445,12 +446,11 @@ function endConversationAndReturn() {
     location.href = RETURN_URL;
     return;
   }
-  // No return URL available (e.g. an old link without it, or opened directly) — fall back to the
-  // previous approach, with the same guaranteed-visible fallback state either way.
-  try { window.close(); } catch (e) {}
-  setTimeout(function() {
-    setStatus('Conversation ended', 'You can close this tab, or tap below to talk again', null);
-  }, 400);
+  // No return URL available (e.g. an old link without it, or opened directly). Not attempting
+  // window.close() here either — it's proven unreliable across repeated real tests, and the
+  // original SurgiLog tab was never touched or closed in the first place, so switching to it
+  // manually always works regardless of what this page's own JS does.
+  setStatus('Conversation ended', 'Switch back to your SurgiLog tab (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
