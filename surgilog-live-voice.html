@@ -55,7 +55,7 @@
 <div class="wrap">
   <div class="header">
     <div class="tag" style="cursor:pointer; text-decoration:underline;" onclick="endConversationAndReturn()">&larr; Return to SurgiLog</div>
-    <div style="font-size:11px; color:#8ca3c9; margin-top:4px;">This opened in a new tab — your SurgiLog tab is still open behind it. If tapping above doesn't return you automatically, just switch tabs (swipe up, or tap your open-tabs button) — no need to close this one.</div>
+    <div style="font-size:11px; color:#8ca3c9; margin-top:4px;">This opened in a new tab — your SurgiLog tab is still open behind it, untouched. The link above is worth a tap, but the reliable way back is simply switching tabs (swipe up, or your open-tabs button) — no need to close this one.</div>
     <h1>🎙️ Live Voice</h1>
     <p>Talk naturally — the Secretary will respond out loud.</p>
   </div>
@@ -444,24 +444,17 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27: two prior fixes (micStream guard, wrapping endSession() itself) were both confirmed
-  // deployed and the exact same mic-permission-reappears symptom still happened — meaning the
-  // original theory was incomplete. Rather than guess a fourth cause, this makes every step visible
-  // on screen, so the next attempt gives real evidence instead of another "same thing happened."
-  var wasActive = sessionActive; // capture BEFORE endSession() changes it
-  var errMsg = "";
-  try { endSession(); } catch (e) { errMsg = String(e && e.message || e); }
-  if (errMsg) {
-    setStatus('DEBUG: endSession() threw', errMsg.slice(0, 90), null);
-    return;
-  }
-  if (!RETURN_URL) {
-    setStatus('DEBUG: no RETURN_URL', 'wasActive=' + wasActive, null);
-    return;
-  }
-  setStatus('DEBUG: navigating\u2026', 'wasActive=' + wasActive + ' | url starts: ' + RETURN_URL.slice(0, 50), null);
-  location.href = RETURN_URL;
-  return;
+  // 2026-07-27 CONCLUSION: real on-device diagnostics confirmed this function runs completely
+  // correctly every time — sessionActive captured correctly, endSession() completes without
+  // throwing, RETURN_URL is correctly populated with the right URL, and location.href = RETURN_URL
+  // genuinely executes. Despite all of that, Safari does not perform the navigation. That's not a
+  // fixable JS bug — it's a real platform behavior around a window.open()'d tab navigating itself to
+  // a different origin, and no further code change here will fix it. Left in as a harmless best-
+  // effort attempt (it may work on other devices/browsers), but the manual return — switching tabs,
+  // since the original SurgiLog tab was never touched — is now the only thing this page depends on.
+  try { endSession(); } catch (e) {}
+  if (RETURN_URL) { try { location.href = RETURN_URL; } catch (e) {} }
+  setStatus('Conversation ended', 'Switch back to your SurgiLog tab (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
