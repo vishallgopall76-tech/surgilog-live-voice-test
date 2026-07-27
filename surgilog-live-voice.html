@@ -54,8 +54,8 @@
 <body>
 <div class="wrap">
   <div class="header">
-    <div class="tag" style="cursor:pointer; text-decoration:underline;" onclick="endConversationAndReturn()">&larr; Return to SurgiLog</div>
-    <div style="font-size:11px; color:#8ca3c9; margin-top:4px;">This opened in a new tab — your SurgiLog tab is still open behind it, untouched. The link above is worth a tap, but the reliable way back is simply switching tabs (swipe up, or your open-tabs button) — no need to close this one.</div>
+    <div class="tag" style="cursor:pointer; text-decoration:underline;" onclick="endConversationAndReturn()">End &amp; show me how to get back</div>
+    <div style="font-size:11px; color:#8ca3c9; margin-top:4px;">This opened in a new tab — your SurgiLog tab is still open behind it, untouched, the whole time. When you're done here, switch tabs (swipe up, or your open-tabs button) to go back to it — that's the only way back, and it always works.</div>
     <h1>🎙️ Live Voice</h1>
     <p>Talk naturally — the Secretary will respond out loud.</p>
   </div>
@@ -444,28 +444,19 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27 REVISED: the previous version showed "Conversation ended, switch tabs" immediately
-  // after attempting navigation — but the actual reported pattern (second attempt succeeds, first
-  // doesn't) doesn't fit "Safari refuses this outright," which would fail identically every time. It
-  // fits "navigation is genuinely a little slow" (Apps Script's own redirect chain has a couple of
-  // hops) far better — and showing a competing "switch tabs manually" message immediately very
-  // plausibly caused the interruption itself, by inviting an action before the navigation had a real
-  // chance to finish. This now shows a clear WAITING state first, and only offers the manual
-  // fallback after genuinely giving the automatic path room to complete on its own.
-  try { endSession(); } catch (e) {}
-  if (!RETURN_URL) {
-    setStatus('Conversation ended', 'Switch back to your SurgiLog tab (swipe up, or your open-tabs button) \u2014 it was never closed', null);
-    return;
-  }
-  setStatus('Returning to SurgiLog\u2026', 'Just a moment \u2014 please wait, don\u2019t tap anything', null);
-  setTimeout(function() {
-    try { location.href = RETURN_URL; } catch (e) {}
-  }, 50); // tiny delay so the waiting message actually paints before navigation begins
-  // If this page is still here after a real wait, THEN offer the manual fallback — never before
-  // giving the automatic path genuine time to finish first.
-  setTimeout(function() {
-    setStatus('Still here?', 'Switch to your SurgiLog tab manually (swipe up, or your open-tabs button) \u2014 it was never closed', null);
-  }, 5000);
+  // 2026-07-27 FINAL: every attempt at automated return — window.close(), direct navigation, a
+  // delayed navigation, a stripped-down pre-navigation cleanup — has either failed outright or made
+  // things worse (the WebKit crash-reload, the mic prompt reappearing on its own). That pattern
+  // means the attempt itself is very likely the problem, on this specific device, not any particular
+  // implementation of it. Stopping here: no navigation attempt of any kind. Just stop the session
+  // immediately and tell you clearly to switch tabs — nothing else running afterward that could
+  // trigger a side effect.
+  sessionActive = false;
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
+  var btn = document.getElementById('mainBtn');
+  if (btn) { btn.textContent = 'Start Conversation'; btn.className = 'btn btn-start'; }
+  setStatus('Conversation ended', 'Switch to your SurgiLog tab now (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
