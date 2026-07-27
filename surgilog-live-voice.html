@@ -444,17 +444,28 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27 CONCLUSION: real on-device diagnostics confirmed this function runs completely
-  // correctly every time — sessionActive captured correctly, endSession() completes without
-  // throwing, RETURN_URL is correctly populated with the right URL, and location.href = RETURN_URL
-  // genuinely executes. Despite all of that, Safari does not perform the navigation. That's not a
-  // fixable JS bug — it's a real platform behavior around a window.open()'d tab navigating itself to
-  // a different origin, and no further code change here will fix it. Left in as a harmless best-
-  // effort attempt (it may work on other devices/browsers), but the manual return — switching tabs,
-  // since the original SurgiLog tab was never touched — is now the only thing this page depends on.
+  // 2026-07-27 REVISED: the previous version showed "Conversation ended, switch tabs" immediately
+  // after attempting navigation — but the actual reported pattern (second attempt succeeds, first
+  // doesn't) doesn't fit "Safari refuses this outright," which would fail identically every time. It
+  // fits "navigation is genuinely a little slow" (Apps Script's own redirect chain has a couple of
+  // hops) far better — and showing a competing "switch tabs manually" message immediately very
+  // plausibly caused the interruption itself, by inviting an action before the navigation had a real
+  // chance to finish. This now shows a clear WAITING state first, and only offers the manual
+  // fallback after genuinely giving the automatic path room to complete on its own.
   try { endSession(); } catch (e) {}
-  if (RETURN_URL) { try { location.href = RETURN_URL; } catch (e) {} }
-  setStatus('Conversation ended', 'Switch back to your SurgiLog tab (swipe up, or your open-tabs button) \u2014 it was never closed', null);
+  if (!RETURN_URL) {
+    setStatus('Conversation ended', 'Switch back to your SurgiLog tab (swipe up, or your open-tabs button) \u2014 it was never closed', null);
+    return;
+  }
+  setStatus('Returning to SurgiLog\u2026', 'Just a moment \u2014 please wait, don\u2019t tap anything', null);
+  setTimeout(function() {
+    try { location.href = RETURN_URL; } catch (e) {}
+  }, 50); // tiny delay so the waiting message actually paints before navigation begins
+  // If this page is still here after a real wait, THEN offer the manual fallback — never before
+  // giving the automatic path genuine time to finish first.
+  setTimeout(function() {
+    setStatus('Still here?', 'Switch to your SurgiLog tab manually (swipe up, or your open-tabs button) \u2014 it was never closed', null);
+  }, 5000);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
