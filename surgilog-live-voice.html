@@ -444,18 +444,15 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27 FINAL: every attempt at automated return — window.close(), direct navigation, a
-  // delayed navigation, a stripped-down pre-navigation cleanup — has either failed outright or made
-  // things worse (the WebKit crash-reload, the mic prompt reappearing on its own). That pattern
-  // means the attempt itself is very likely the problem, on this specific device, not any particular
-  // implementation of it. Stopping here: no navigation attempt of any kind. Just stop the session
-  // immediately and tell you clearly to switch tabs — nothing else running afterward that could
-  // trigger a side effect.
-  sessionActive = false;
-  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
-  var btn = document.getElementById('mainBtn');
-  if (btn) { btn.textContent = 'Start Conversation'; btn.className = 'btn btn-start'; }
+  // 2026-07-27 CORRECTED: this was stripped down to skip closing AudioContexts and the wake lock,
+  // reasoning that the page was about to navigate away and the browser would clean those up as part
+  // of normal unload. But navigation was then removed entirely (see below) — the page never unloads
+  // anymore, you just manually switch tabs. That means those audio resources were never being closed
+  // at all: left alive, in the background, indefinitely. iOS is known to aggressively penalize
+  // background tabs holding active microphone/audio sessions — a very plausible explanation for
+  // inconsistent problems specifically around closing, on iOS specifically, not desktop. Back to
+  // full, proper cleanup via endSession() now that there's no navigation left to protect from it.
+  try { endSession(); } catch (e) {}
   setStatus('Conversation ended', 'Switch to your SurgiLog tab now (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
