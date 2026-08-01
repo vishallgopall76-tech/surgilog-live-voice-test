@@ -322,8 +322,13 @@ async function startSession() {
         // whatever's in its training data. Per ai.google.dev/gemini-api/docs/live-api/tools this is
         // the whole config needed; the model decides for itself when a query actually needs a
         // search versus just answering directly. If this ever starts erroring on setup, check that
-        // MODEL still supports google_search grounding in Live sessions.
-        tools: [{ google_search: {} }]
+        // MODEL still supports googleSearch grounding in Live sessions. 2026-07-28 CORRECTED: was
+        // snake_case google_search — that's the Python SDK's convention, not the actual JSON wire
+        // field. Confirmed against ai.google.dev's own JS example (tools: [{ googleSearch: {} }]).
+        // It didn't error with the wrong name (unlike inputAudioTranscription above), so it was
+        // very likely just silently ignored as an unrecognized field this whole time — meaning
+        // search grounding probably wasn't actually running even though nothing looked broken.
+        tools: [{ googleSearch: {} }]
       }
     };
     ws.send(JSON.stringify(setupMessage));
@@ -604,7 +609,7 @@ function cancelCapture_() {
 }
 initCaptureModeUi_();
 
-
+// 2026-07-26: auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap —
 // matching how Claude's own Voice Mode works (tap once, immediately listening), not a wake word
 // (which nothing web-based can do — see the chat this came from). If the browser blocks the
 // auto-triggered microphone request (iOS can be strict about requiring a direct tap on THIS page,
