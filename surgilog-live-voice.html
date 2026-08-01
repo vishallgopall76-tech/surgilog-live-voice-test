@@ -289,31 +289,33 @@ async function startSession() {
     //      back: Unknown name "config": Cannot find field.
     //   2. responseModalities lives inside a nested "generationConfig" object, not as a sibling of
     //      "model" and "systemInstruction".
-    // inputAudioTranscription/outputAudioTranscription ARE real, valid fields per this same
-    // reference (unlike the token endpoint's liveConnectConstraints, which genuinely doesn't exist)
-    // — 2026-07-28: now actually turned on below. They'd been left out on purpose back on 2026-07-26
-    // to isolate the structural setup-message fix in isolation, but the message handler already
-    // reads sc.inputTranscription/sc.outputTranscription (see handleServerMessage) — without
-    // requesting them here they were silently never arriving. Real bug, now fixed as part of this
-    // pass rather than a separate one, since capture mode below depends on inputTranscription
-    // actually working.
+    // 2026-07-28 CORRECTED: inputAudioTranscription/outputAudioTranscription are fields of
+    // BidiGenerateContentSetup itself, SIBLINGS of generationConfig — NOT nested inside it. The
+    // first version of this fix nested them inside generationConfig, which the API rejected outright
+    // (code 1007, "Unknown name 'inputAudioTranscription' ... Cannot find field") and killed every
+    // session, talk mode included, the moment setup was sent. Confirmed against the official field
+    // table at ai.google.dev/api/live#BidiGenerateContentSetup — model/generationConfig/
+    // systemInstruction/tools/inputAudioTranscription/outputAudioTranscription are all top-level
+    // fields of `setup`. Left out entirely between 2026-07-26 and today specifically because this
+    // hadn't been confirmed working yet — should have kept it out until actually tested against a
+    // live connection rather than trusting general Live API docs for BidiGenerateContent instead of
+    // this app's actual BidiGenerateContentConstrained endpoint's exact message shape.
     var setupMessage = IS_CAPTURE_MODE ? {
-      // 2026-07-28: capture mode (opened from a field's 🎙 Secretary button) — TEXT modality only
+      // 2026-07-28: capture mode (opened from a field's 🎙 Dictate button) — TEXT modality only
       // (no spoken reply, cheaper), no search tool (not needed, keeps behavior predictable for a
       // clinical record), input transcription on since that's the entire point of this mode.
       setup: {
         model: 'models/' + MODEL,
-        generationConfig: { responseModalities: ['TEXT'], inputAudioTranscription: {} },
+        generationConfig: { responseModalities: ['TEXT'] },
+        inputAudioTranscription: {},
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
       }
     } : {
       setup: {
         model: 'models/' + MODEL,
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {}
-        },
+        generationConfig: { responseModalities: ['AUDIO'] },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         // 2026-07-28: live Google Search grounding — lets the Secretary look things up in real
         // time (medical guidelines, current info, anything) instead of only knowing the app and
