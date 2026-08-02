@@ -71,15 +71,6 @@
     <div class="error-box" id="errorBox"></div>
   </div>
 
-  <!-- 2026-07-28: capture mode only (opened from a field's 🎙 Dictate button) — editable so the
-       person can hand-correct before it goes back to SurgiLog, on top of the auto clean-up that
-       runs there right after. Hidden entirely in normal talk mode. -->
-  <div class="stage" id="captureBox" style="display:none;">
-    <textarea id="captureText" rows="6" style="width:100%; box-sizing:border-box; border:1px solid #dde3ee; border-radius:12px; padding:12px; font-size:14px; font-family:inherit; resize:vertical; margin-bottom:14px;" placeholder="Speak — your words will appear here as you go. You can edit before sending."></textarea>
-    <button class="btn btn-start" id="captureDoneBtn" onclick="sendCaptureResult_()" style="margin-bottom:8px;">✅ Done — Send to SurgiLog</button>
-    <button class="btn" style="background:#eef1f7; color:#445;" onclick="cancelCapture_()">✖ Cancel</button>
-  </div>
-
   <div class="transcript" id="debugPanel" style="margin-bottom:16px; display:none;">
     <div class="transcript-label">Diagnostics</div>
     <div id="debugBody" style="font-size:12px; color:#4a5568; line-height:1.7;"></div>
@@ -110,18 +101,12 @@ var LIVE_TOKEN = params.get('token') || '';
 var MODEL = params.get('model') || 'gemini-3.1-flash-live-preview';
 var SYSTEM_PROMPT = params.get('prompt') || "You are a helpful assistant.";
 var RETURN_URL = params.get('returnUrl') || '';
-// 2026-07-28: presence of `field` means this page was opened from a specific form field's 🎙
-// Dictate button (see dictationButtonsHtml_ / toggleDictation_ in Index.html) rather than the
-// standalone "Talk to the Secretary" button — same page, same engine, deliberately different mode:
-// silent transcription capture instead of a two-way spoken conversation. session/submitUrl/origin
-// mirror the exact contract the old dictation-helper.html used, so Index.html's existing delivery
-// logic (postMessage + doPost polling fallback) needed no changes at all.
-var CAPTURE_FIELD = params.get('field') || '';
-var CAPTURE_SESSION = params.get('session') || '';
-var SUBMIT_URL = params.get('submitUrl') || '';
-var OPENER_ORIGIN = params.get('origin') || '';
-var IS_CAPTURE_MODE = !!CAPTURE_FIELD;
-var captureTranscript = ''; // accumulates across the whole capture session, not just one turn
+// 2026-08-01: this page is now Live Voice Conversation ONLY — dictation was split back out to its
+// own dictation-helper.html (free browser speech recognition, no Gemini API/quota involved at all)
+// after v4.10/4.11 accidentally made every single Dictate tap on any field consume the same shared
+// Gemini Live API quota as a full conversation. That's a genuinely higher, ongoing cost baked into
+// routine daily use (dozens of dictations per shift), not a one-off testing spike — worth keeping
+// permanently separate rather than re-merging later for "one file" tidiness.
 
 var ws = null;
 var micStream = null;
@@ -297,17 +282,7 @@ async function startSession() {
     // the official field table at ai.google.dev/api/live#BidiGenerateContentSetup — model,
     // generationConfig, systemInstruction, tools, inputAudioTranscription, outputAudioTranscription
     // are all top-level fields of `setup`.
-    var setupMessage = IS_CAPTURE_MODE ? {
-      // 2026-07-28: capture mode (opened from a field's 🎙 Dictate button) — TEXT modality only
-      // (no spoken reply, cheaper), no search tool (not needed, keeps behavior predictable for a
-      // clinical record), input transcription on since that's the entire point of this mode.
-      setup: {
-        model: 'models/' + MODEL,
-        generationConfig: { responseModalities: ['TEXT'] },
-        inputAudioTranscription: {},
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
-      }
-    } : {
+    var setupMessage = {
       setup: {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
@@ -336,8 +311,7 @@ async function startSession() {
       document.getElementById('mainBtn').className = 'btn btn-end';
       document.getElementById('mainBtn').disabled = false;
       var rateNote = (captureCtx.sampleRate !== 16000) ? ' (mic ran at ' + captureCtx.sampleRate + 'Hz, resampled to 16kHz)' : '';
-      if (IS_CAPTURE_MODE) { setStatus('Listening…', 'Dictate now' + rateNote, 'listening'); }
-      else { setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening'); }
+      setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening');
       debugStats.wsState = 'OPEN';
       renderDebug();
     } catch (audioErr) {
@@ -376,21 +350,6 @@ async function startSession() {
     if (response.setupComplete) return;
     if (response.serverContent) {
       var sc = response.serverContent;
-      if (IS_CAPTURE_MODE) {
-        // Capture mode: ignore anything the model says back (TEXT modality means there's no audio
-        // to play anyway) — the only thing that matters here is the user's own speech, transcribed.
-        if (sc.inputTranscription && sc.inputTranscription.text) {
-          captureTranscript += sc.inputTranscription.text;
-          updateCaptureBox_();
-        }
-        if (sc.turnComplete) {
-          // Add a space so the next utterance doesn't run into this one, then keep listening —
-          // capture mode stays open across many pauses until the user taps Done.
-          if (captureTranscript && !/\s$/.test(captureTranscript)) captureTranscript += ' ';
-          setStatus('Listening…', 'Dictate now — tap Done when finished', 'listening');
-        }
-        return;
-      }
       if (sc.modelTurn && sc.modelTurn.parts) {
         sc.modelTurn.parts.forEach(function(part) {
           if (part.inlineData && part.inlineData.data) {
@@ -556,55 +515,6 @@ function endConversationAndReturn() {
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
-
-// 2026-07-28: capture mode swaps the header copy and shows the editable transcript box instead of
-// the normal talk-mode transcript/debug panels — same page, same auto-start-on-load behavior below,
-// just a different job once connected.
-function initCaptureModeUi_() {
-  if (!IS_CAPTURE_MODE) return;
-  document.querySelector('.header h1').textContent = '🎙️ Secretary — Dictate';
-  document.querySelector('.header p').textContent = 'Speak naturally — tap Done when finished, then vet it back in SurgiLog before saving.';
-  document.getElementById('captureBox').style.display = 'block';
-  document.getElementById('mainBtn').style.display = 'none'; // capture auto-starts; Done/Cancel replace Start/End
-  var transcriptPanels = document.querySelectorAll('.transcript');
-  transcriptPanels.forEach(function(p) { p.style.display = 'none'; }); // no talk transcript/sources here
-}
-function updateCaptureBox_() {
-  var ta = document.getElementById('captureText');
-  // Don't stomp on manual edits mid-dictation: only auto-append if the box still matches what we
-  // last wrote — if the person has started hand-editing, leave it alone and let them keep typing.
-  if (ta.dataset.lastAuto === undefined || ta.value === ta.dataset.lastAuto) {
-    ta.value = captureTranscript;
-    ta.dataset.lastAuto = captureTranscript;
-    ta.scrollTop = ta.scrollHeight;
-  }
-}
-function sendCaptureResult_() {
-  var text = (document.getElementById('captureText').value || '').trim();
-  try { endSession(); } catch (e) {}
-  if (!text) { setStatus('Nothing to send', 'Dictate something first, or tap Cancel', null); return; }
-  var delivered = false;
-  if (window.opener) {
-    try { window.opener.postMessage({ source: 'surgilog_dictation', text: text }, OPENER_ORIGIN || '*'); delivered = true; } catch (e) {}
-  }
-  // Fallback POST — same doPost contract dictation-helper.html always used, matters most when
-  // SurgiLog is running as an iOS Home Screen app, where window.opener often isn't available.
-  if (SUBMIT_URL && CAPTURE_SESSION) {
-    try {
-      fetch(SUBMIT_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify({ session: CAPTURE_SESSION, text: text }) });
-      delivered = true;
-    } catch (e) {}
-  }
-  setStatus(delivered ? 'Sent ✓' : 'Couldn\u2019t deliver', delivered ? 'Switch back to SurgiLog \u2014 it\u2019s already there' : 'Copy the text manually and switch back to SurgiLog', null);
-  document.getElementById('captureDoneBtn').disabled = true;
-  setTimeout(function() { try { window.close(); } catch (e) {} }, 400);
-}
-function cancelCapture_() {
-  try { endSession(); } catch (e) {}
-  try { window.close(); } catch (e) {}
-  setStatus('Cancelled', 'Switch back to SurgiLog \u2014 nothing was sent', null);
-}
-initCaptureModeUi_();
 
 // 2026-07-26: auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap —
 // matching how Claude's own Voice Mode works (tap once, immediately listening), not a wake word
