@@ -256,14 +256,7 @@ async function startSession() {
       setup: {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        // 2026-08-02: live Google Search grounding — lets the Secretary look things up in real
-        // time (medical guidelines, current info, anything) instead of only knowing the app and
-        // whatever's in its training data. Field name must be camelCase googleSearch, not
-        // snake_case google_search (the Python SDK's naming convention, not the actual JSON wire
-        // format) — confirmed against ai.google.dev's own JS example. The model decides for itself
-        // when a query actually needs a search versus just answering directly.
-        tools: [{ googleSearch: {} }]
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
       }
     };
     ws.send(JSON.stringify(setupMessage));
