@@ -257,6 +257,16 @@ async function startSession() {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
+        // 2026-08-02 REMOVED: tools: [{ googleSearch: {} }] was added here, then confirmed by a
+        // direct isolated test to be the actual cause of "exceeded quota" errors — the person's own
+        // unmodified original file (identical except missing this one line) worked fine, general
+        // conversation and all, while this version with the search tool declared did not. Most
+        // likely explanation: Google Search grounding sits in its own, separately-metered quota
+        // bucket from plain Live API audio streaming, and appears to be at zero allocation for this
+        // project — just DECLARING the tool as available seems to be enough to push the session into
+        // that stricter bucket, even before the model ever actually calls it. Live Voice Conversation
+        // works fine without this; do not re-add without first confirming the account's actual
+        // Search-grounding quota, not just the base Live API quota, has real room.
       }
     };
     ws.send(JSON.stringify(setupMessage));
