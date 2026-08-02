@@ -27,6 +27,7 @@
   }
   .orb.listening { background: #e5f7ea; border-color: #7ed49a; box-shadow: 0 0 0 8px rgba(126,212,154,0.25); }
   .orb.speaking { background: #fff4e2; border-color: #f0c987; box-shadow: 0 0 0 8px rgba(240,201,135,0.25); }
+  .orb.thinking { background: #eef0ff; border-color: #b3b9f7; box-shadow: 0 0 0 8px rgba(150,160,240,0.2); }
   .orb.error { background: #fde8d8; border-color: #e08a5b; }
   .status { font-size: 14px; font-weight: 700; color: #1c4e80; margin-bottom: 4px; }
   .substatus { font-size: 12px; color: #8899b0; margin-bottom: 18px; min-height: 16px; }
@@ -46,9 +47,6 @@
   .line.user::before { content: "You: "; font-weight: 700; color: #4a6b9c; }
   .line.secretary { color: #1a1a1a; }
   .line.secretary::before { content: "Secretary: "; font-weight: 700; color: #1c4e80; }
-  .line.sources { color: #8899b0; font-size: 11px; margin-top: -4px; margin-bottom: 12px; }
-  .line.sources a { color: #4a6b9c; text-decoration: none; }
-  .line.sources a:not(:last-child)::after { content: " \00b7 "; color: #b7bfcc; }
   .empty { font-size: 12px; color: #b7bfcc; text-align: center; padding: 8px 0; }
 
   .error-box { background: #fde8d8; border: 1px solid #e08a5b; border-radius: 12px; padding: 12px 14px; font-size: 12.5px; color: #8a4b00; margin-top: 14px; display: none; }
@@ -68,6 +66,7 @@
     <div class="status" id="status">Connecting…</div>
     <div class="substatus" id="substatus">Starting automatically…</div>
     <button class="btn btn-start" id="mainBtn" onclick="toggleSession()">Start Conversation</button>
+    <button class="btn" id="replayBtn" onclick="replayLastReply_()" style="display:none; background:#eef1f7; color:#445; margin-top:8px;">🔊 Replay last reply</button>
     <div class="error-box" id="errorBox"></div>
   </div>
 
@@ -83,40 +82,43 @@
 </div>
 
 <script>
-// Real counters instead of guessing — shows exactly which stage of the pipeline is actually
-// running: mic capturing, chunks reaching the server, and anything at all coming back.
-var debugStats = { chunksSent: 0, bytesSent: 0, messagesReceived: 0, lastMessageType: 'none', wsState: '-' };
+/* ============================================================================================
+   2026-08-02: Live Voice Conversation runs on the browser's own free speech engine, same
+   foundation as dictation-helper.html — no Gemini Live API, no quota dependency at all. This
+   follows the same real diagnosis that led to splitting dictation out earlier today: the Gemini
+   Live API's free-tier quota for this project appears to be genuinely zero for the preview model
+   this used (0/0, not "used up and refilling" — confirmed by the SAME "exceeded quota" error
+   recurring hours apart, well past any per-minute or per-day reset window, even with dictation
+   already fully separated and consuming nothing). Rather than depend on enabling billing (a real,
+   consistent budget constraint), this talks via postMessage to Index.html, which calls the SAME
+   askAiAgent() endpoint typed chat already uses reliably — same personality, same live Google
+   Search grounding, same broadened "talk about anything" scope from tonight's prompt work, just a
+   completely different, free, unlimited transport underneath. Turn-based instead of true
+   low-latency interrupt-anytime streaming, but it actually works without needing billing enabled,
+   which was the explicit, repeated requirement all night.
+   ============================================================================================ */
+
+var debugStats = { finalsHeard: 0, messagesReceived: 0, lastEvent: 'none', recognitionState: '-' };
 function renderDebug() {
   document.getElementById('debugPanel').style.display = 'block';
   document.getElementById('debugBody').innerHTML =
-    'WebSocket state: ' + debugStats.wsState + '<br>' +
-    'Audio chunks sent: ' + debugStats.chunksSent + ' (' + debugStats.bytesSent + ' bytes total)<br>' +
-    'Messages received from server: ' + debugStats.messagesReceived + '<br>' +
-    'Last message type: ' + debugStats.lastMessageType;
+    'Recognition state: ' + debugStats.recognitionState + '<br>' +
+    'Final phrases heard: ' + debugStats.finalsHeard + '<br>' +
+    'Replies received: ' + debugStats.messagesReceived + '<br>' +
+    'Last event: ' + debugStats.lastEvent;
 }
 
 // ---------- Config passed in from SurgiLog ----------
 var params = new URLSearchParams(window.location.search);
-var LIVE_TOKEN = params.get('token') || '';
-var MODEL = params.get('model') || 'gemini-3.1-flash-live-preview';
-var SYSTEM_PROMPT = params.get('prompt') || "You are a helpful assistant.";
 var RETURN_URL = params.get('returnUrl') || '';
-// 2026-08-01: this page is now Live Voice Conversation ONLY — dictation was split back out to its
-// own dictation-helper.html (free browser speech recognition, no Gemini API/quota involved at all)
-// after v4.10/4.11 accidentally made every single Dictate tap on any field consume the same shared
-// Gemini Live API quota as a full conversation. That's a genuinely higher, ongoing cost baked into
-// routine daily use (dozens of dictations per shift), not a one-off testing spike — worth keeping
-// permanently separate rather than re-merging later for "one file" tidiness.
 
-var ws = null;
-var micStream = null;
-var captureCtx = null, captureNode = null;
-var playbackCtx = null, playbackNode = null;
+var recognition = null;
 var sessionActive = false;
-var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
-var wakeLock = null; // keeps the screen from auto-locking during an active conversation — best-effort only
-var currentUserLine = "", currentSecretaryLine = "";
-var currentTurnSources = []; // {title, uri} pairs from Google Search grounding, this turn only
+var awaitingReply = false;   // true from the moment we send a heard phrase to SurgiLog until a reply arrives
+var deliberatelyStopped = false; // distinguishes "we stopped it on purpose" from the engine stopping itself (needs auto-restart)
+var wakeLock = null; // keeps the screen from auto-locking during an active session — best-effort only
+var currentUserLine = "";
+var synth = window.speechSynthesis || null;
 
 function setStatus(text, sub, mode) {
   document.getElementById('status').textContent = text;
@@ -144,9 +146,6 @@ function addTranscriptLine(speaker, text) {
   div.id = 'live-' + speaker;
   div.textContent = text;
   body.appendChild(div);
-  // 2026-07-27: cap how many finalized lines stay in the DOM — a much smaller contributor than the
-  // base64 fix below, but the same underlying principle: unbounded growth over a long conversation
-  // adds up. Keeps roughly the most recent 100 lines, which is already far more than fits on screen.
   while (body.children.length > 100) { body.removeChild(body.firstChild); }
   body.scrollTop = body.scrollHeight;
 }
@@ -154,379 +153,229 @@ function finalizeTranscriptLine(speaker) {
   var el = document.getElementById('live-' + speaker);
   if (el) el.removeAttribute('id');
 }
-function addSourcesLine(sources) {
-  // Small, skippable line under a grounded reply — just enough to show it wasn't recalled from
-  // memory, without turning the transcript into a bibliography. Capped at 3 links.
-  var body = document.getElementById('transcriptBody');
-  var div = document.createElement('div');
-  div.className = 'line sources';
-  sources.slice(0, 3).forEach(function(s) {
-    var a = document.createElement('a');
-    a.href = s.uri; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    a.textContent = s.title;
-    div.appendChild(a);
-  });
-  body.appendChild(div);
-  while (body.children.length > 100) { body.removeChild(body.firstChild); }
-  body.scrollTop = body.scrollHeight;
-}
-
-// ---------- Audio worklets, loaded from in-memory Blob URLs (keeps this a single file) ----------
-var CAPTURE_WORKLET_SRC = "class CaptureProcessor extends AudioWorkletProcessor {" +
-  "process(inputs) {" +
-  "  var input = inputs[0];" +
-  "  if (input && input[0] && input[0].length) { this.port.postMessage(input[0].slice()); }" +
-  "  return true;" +
-  "}}" +
-  "registerProcessor('capture-processor', CaptureProcessor);";
-
-var PLAYBACK_WORKLET_SRC = "class PlaybackProcessor extends AudioWorkletProcessor {" +
-  "constructor() { super(); this.queue = []; this.offset = 0;" +
-  "  this.port.onmessage = (e) => {" +
-  "    if (e.data === 'interrupt') { this.queue = []; this.offset = 0; }" +
-  "    else { this.queue.push(e.data); }" +
-  "  };" +
-  "}" +
-  "process(inputs, outputs) {" +
-  "  var output = outputs[0][0];" +
-  "  for (var i = 0; i < output.length; i++) {" +
-  "    if (this.queue.length === 0) { output[i] = 0; continue; }" +
-  "    var chunk = this.queue[0];" +
-  "    output[i] = chunk[this.offset++];" +
-  "    if (this.offset >= chunk.length) { this.queue.shift(); this.offset = 0; }" +
-  "  }" +
-  "  return true;" +
-  "}}" +
-  "registerProcessor('playback-processor', PlaybackProcessor);";
-
-function blobUrlFor(src) {
-  return URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-}
-
-// ---------- PCM <-> base64 helpers ----------
-function floatTo16BitPCM(float32Array) {
-  var out = new Int16Array(float32Array.length);
-  for (var i = 0; i < float32Array.length; i++) {
-    var s = Math.max(-1, Math.min(1, float32Array[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out.buffer;
-}
-function arrayBufferToBase64(buffer) {
-  // 2026-07-27 FIX: was building this string one character at a time in a loop — for a chunk this
-  // small (~256 bytes) that's not the bottleneck on its own, but this runs ~125 times/second for the
-  // entire conversation, so it adds up to millions of small string allocations over several minutes.
-  // Real, measurable CPU/memory churn on top of everything else running concurrently (WebSocket,
-  // audio worklets, DOM updates) — plausibly part of what pushes memory pressure high enough for iOS
-  // to kill the page's process on a longer conversation. Bulk conversion in one call instead.
-  var bytes = new Uint8Array(buffer);
-  var binary = String.fromCharCode.apply(null, bytes);
-  return window.btoa(binary);
-}
-function base64ToFloat32(base64) {
-  var binary = atob(base64);
-  var bytes = new Uint8Array(binary.length);
-  for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  var int16 = new Int16Array(bytes.buffer);
-  var float32 = new Float32Array(int16.length);
-  for (var j = 0; j < int16.length; j++) float32[j] = int16[j] / 32768;
-  return float32;
-}
 
 // ---------- Main session control ----------
 function toggleSession() {
   if (sessionActive) { endConversationAndReturn(); } else { startSession(); }
 }
 
+function getRecognitionCtor_() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
 async function startSession() {
   clearError();
-  isAiSpeaking = false;
-  if (!LIVE_TOKEN) { showError('No voice token was passed in. Open this page from the SurgiLog Secretary, not directly.'); return; }
+  var Ctor = getRecognitionCtor_();
+  if (!Ctor) {
+    showError('This browser doesn\u2019t support built-in speech recognition. On iPhone, use Safari (not another browser app) \u2014 Chrome/Firefox on iOS don\u2019t support it even though they look the same.');
+    return;
+  }
+  if (!synth) {
+    showError('This browser can\u2019t speak replies aloud \u2014 you\u2019ll still see them written in the transcript below.');
+  }
   document.getElementById('mainBtn').disabled = true;
-  setStatus('Connecting…', 'Setting up microphone and connection', null);
-  // 2026-07-27: can't keep the conversation running with the screen fully OFF — iOS suspends both
-  // the WebSocket and the microphone the instant the screen locks, a real platform restriction, not
-  // something fixable here. This is the honest next-best thing: stop the screen from auto-locking
-  // WHILE a conversation is active, so at least it won't cut out just from sitting untouched for a
-  // few seconds. Not supported on every browser, and best-effort even where it is — never treated
-  // as required for the conversation itself to work.
+  setStatus('Starting…', 'Requesting microphone access', null);
   try {
     if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
   } catch (e) { wakeLock = null; }
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-  } catch (e) {
-    showError('Microphone access was blocked or denied. Check your browser permissions and try again.');
+
+  recognition = new Ctor();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = navigator.language || 'en-US';
+
+  recognition.onstart = function() {
+    sessionActive = true;
+    deliberatelyStopped = false;
+    document.getElementById('mainBtn').textContent = 'End Conversation';
+    document.getElementById('mainBtn').className = 'btn btn-end';
     document.getElementById('mainBtn').disabled = false;
+    debugStats.recognitionState = 'listening';
+    debugStats.lastEvent = 'start';
+    renderDebug();
+    setStatus('Listening…', 'Just talk naturally', 'listening');
+  };
+
+  recognition.onresult = function(event) {
+    var interim = '', finalPiece = '';
+    for (var i = event.resultIndex; i < event.results.length; i++) {
+      var t = event.results[i][0].transcript;
+      if (event.results[i].isFinal) finalPiece += t;
+      else interim += t;
+    }
+    debugStats.lastEvent = 'result (' + (finalPiece ? 'final' : 'interim') + ')';
+    renderDebug();
+    if (interim) { addTranscriptLine('user', (currentUserLine + ' ' + interim).trim()); }
+    if (finalPiece) {
+      debugStats.finalsHeard++;
+      currentUserLine = (currentUserLine + ' ' + finalPiece).trim();
+      addTranscriptLine('user', currentUserLine);
+      finalizeTranscriptLine('user');
+      sendHeardPhraseToOpener_(currentUserLine);
+      currentUserLine = '';
+    }
+  };
+
+  recognition.onerror = function(event) {
+    debugStats.lastEvent = 'error: ' + event.error;
+    debugStats.recognitionState = 'error';
+    renderDebug();
+    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+      showError('Microphone access was blocked or denied. Check your browser permissions and try again.');
+      deliberatelyStopped = true;
+      endSession();
+      return;
+    }
+    // 'no-speech' and 'aborted' are routine — the onend handler below decides whether to restart.
+  };
+
+  recognition.onend = function() {
+    debugStats.recognitionState = 'stopped';
+    debugStats.lastEvent = 'end';
+    renderDebug();
+    // Continuous mode is documented to stop itself periodically on some browsers (notably iOS
+    // Safari after a stretch of silence) even though nothing actually went wrong — auto-restart
+    // unless we stopped it ourselves (ending the session, or deliberately pausing while waiting
+    // for a reply / while the Secretary is speaking).
+    if (sessionActive && !deliberatelyStopped && !awaitingReply) {
+      try { recognition.start(); } catch (e) { /* already starting — ignore */ }
+    }
+  };
+
+  try {
+    recognition.start();
+  } catch (e) {
+    showError('Couldn\u2019t start listening: ' + e.message);
+    document.getElementById('mainBtn').disabled = false;
+  }
+}
+
+// ---------- Talk mode ----------
+// Sends a finished phrase back to the SurgiLog tab (window.opener), which calls the same free
+// askAiAgent() endpoint typed chat already uses, then posts the reply back to THIS tab (see the
+// message listener below) for us to speak aloud.
+function sendHeardPhraseToOpener_(text) {
+  if (!text) return;
+  awaitingReply = true;
+  try { recognition.stop(); } catch (e) {} // pause listening while we wait — avoids hearing our own reply, and avoids talking over a slow reply
+  setStatus('Thinking…', 'Getting a reply', 'thinking');
+  if (window.opener) {
+    try { window.opener.postMessage({ source: 'surgilog_voice_chat', text: text }, '*'); return; } catch (e) {}
+  }
+  awaitingReply = false;
+  showError('Lost the connection to your SurgiLog tab \u2014 go back to SurgiLog and tap "Live Voice Conversation" again.');
+}
+var lastReplyText = '';
+var speechWatchdog = null;
+window.addEventListener('message', function(event) {
+  if (!event.data || event.data.source !== 'surgilog_voice_reply') return;
+  debugStats.messagesReceived++;
+  debugStats.lastEvent = 'reply received';
+  renderDebug();
+  var text = (event.data.text || '').trim();
+  awaitingReply = false;
+  if (!text) {
+    setStatus('Listening…', 'Just talk naturally', 'listening');
+    if (sessionActive && !deliberatelyStopped) { try { recognition.start(); } catch (e) {} }
     return;
   }
-
-  var wsUrl = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=' + encodeURIComponent(LIVE_TOKEN);
-  ws = new WebSocket(wsUrl);
-
-  ws.onopen = async function() {
-    // 2026-07-26 FIX: confirmed against the authoritative schema at ai.google.dev/api/live (the
-    // low-level field-by-field reference, not just the getting-started example, which turned out to
-    // be simplified/inconsistent in two ways):
-    //   1. The top-level wrapper key must be "setup", not "config" — matches the exact error we got
-    //      back: Unknown name "config": Cannot find field.
-    //   2. responseModalities lives inside a nested "generationConfig" object, not as a sibling of
-    //      "model" and "systemInstruction".
-    // 2026-07-28 CORRECTED (real production error, not a guess): inputAudioTranscription and
-    // outputAudioTranscription are fields of BidiGenerateContentSetup itself — SIBLINGS of
-    // generationConfig, NOT nested inside it. Nesting them inside generationConfig gets the whole
-    // setup message rejected outright (code 1007, "Unknown name inputAudioTranscription ... Cannot
-    // find field"), which kills the session before anything else can even start. Confirmed against
-    // the official field table at ai.google.dev/api/live#BidiGenerateContentSetup — model,
-    // generationConfig, systemInstruction, tools, inputAudioTranscription, outputAudioTranscription
-    // are all top-level fields of `setup`.
-    var setupMessage = {
-      setup: {
-        model: 'models/' + MODEL,
-        generationConfig: { responseModalities: ['AUDIO'] },
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        // 2026-07-28 CORRECTED: was snake_case google_search — the actual JSON wire field is
-        // camelCase googleSearch (the Python SDK's google_search naming is a Python-only
-        // convention, not the wire format; confirmed against ai.google.dev's own JS example:
-        // tools: [{ googleSearch: {} }]). The wrong name didn't error like the transcription fields
-        // did above, so it was very likely just silently ignored as an unrecognized field this
-        // whole time — meaning search grounding probably wasn't actually running even though
-        // nothing looked broken. Lets the Secretary look things up in real time (medical
-        // guidelines, current info, anything) instead of only knowing the app and whatever's in its
-        // training data — the model decides for itself when a query actually needs a search versus
-        // just answering directly. If this ever starts erroring on setup, check that MODEL still
-        // supports googleSearch grounding in Live sessions.
-        tools: [{ googleSearch: {} }]
-      }
-    };
-    ws.send(JSON.stringify(setupMessage));
-    try {
-      await setupAudioPipeline();
-      sessionActive = true;
-      document.getElementById('mainBtn').textContent = 'End Conversation';
-      document.getElementById('mainBtn').className = 'btn btn-end';
-      document.getElementById('mainBtn').disabled = false;
-      var rateNote = (captureCtx.sampleRate !== 16000) ? ' (mic ran at ' + captureCtx.sampleRate + 'Hz, resampled to 16kHz)' : '';
-      setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening');
-      debugStats.wsState = 'OPEN';
-      renderDebug();
-    } catch (audioErr) {
-      showError('Connected, but audio setup failed: ' + audioErr.message);
-      document.getElementById('mainBtn').disabled = false;
-    }
-  };
-
-  ws.onmessage = function(event) {
-    // 2026-07-26 FIX: event.data can be a string (text frame) OR a Blob (binary frame) — the old
-    // code only ever tried JSON.parse(event.data) directly, which throws immediately on a Blob and
-    // was silently swallowed by the catch block. That would perfectly explain audio going out fine
-    // (1260 chunks sent, connection healthy) while messagesReceived stayed frozen at 0 — every
-    // incoming message may have been silently dropped before we ever looked at it. Now handles both
-    // frame types, and shows a parse failure on screen instead of hiding it.
-    if (event.data instanceof Blob) {
-      event.data.text().then(handleServerMessage).catch(function(e) {
-        debugStats.lastMessageType = 'BLOB READ ERROR: ' + e.message;
-        renderDebug();
-      });
-    } else {
-      handleServerMessage(event.data);
-    }
-  };
-  function handleServerMessage(raw) {
-    var response;
-    try { response = JSON.parse(raw); } catch (e) {
-      debugStats.messagesReceived++;
-      debugStats.lastMessageType = 'PARSE FAILED: ' + e.message;
-      renderDebug();
-      return;
-    }
-    debugStats.messagesReceived++;
-    debugStats.lastMessageType = Object.keys(response).join(',') || 'empty';
-    renderDebug();
-    if (response.setupComplete) return;
-    if (response.serverContent) {
-      var sc = response.serverContent;
-      if (sc.modelTurn && sc.modelTurn.parts) {
-        sc.modelTurn.parts.forEach(function(part) {
-          if (part.inlineData && part.inlineData.data) {
-            // 2026-07-27 FIX: browser echoCancellation is only a best-effort hint, and it doesn't
-            // reliably track audio played back through the raw Web Audio API the way it tracks a
-            // normal <audio> element — this page's own speech was getting picked back up by the
-            // mic and misread as user speech (and even triggering the API's own "interrupted"
-            // handling on its own echoed voice). Suppressing outgoing mic audio while the
-            // Secretary's own reply is actively playing removes that path at the source, instead
-            // of hoping the browser's AEC catches it.
-            isAiSpeaking = true;
-            playAudioChunk(part.inlineData.data);
-            setStatus('Speaking…', 'The Secretary is replying', 'speaking');
-          }
-        });
-      }
-      if (sc.inputTranscription && sc.inputTranscription.text) {
-        currentUserLine += sc.inputTranscription.text;
-        addTranscriptLine('user', currentUserLine);
-      }
-      if (sc.outputTranscription && sc.outputTranscription.text) {
-        currentSecretaryLine += sc.outputTranscription.text;
-        addTranscriptLine('secretary', currentSecretaryLine);
-      }
-      // 2026-07-28: when Google Search grounding fires, groundingChunks show up here with a title
-      // + uri per source the model actually drew on. Just collecting them as they stream in —
-      // rendered once, at turnComplete, so it appears as one tidy line under the reply rather than
-      // flickering mid-sentence.
-      var gm = sc.groundingMetadata;
-      if (gm && Array.isArray(gm.groundingChunks)) {
-        gm.groundingChunks.forEach(function(chunk) {
-          if (chunk.web && chunk.web.uri) {
-            var already = currentTurnSources.some(function(s){ return s.uri === chunk.web.uri; });
-            if (!already) currentTurnSources.push({ title: chunk.web.title || 'source', uri: chunk.web.uri });
-          }
-        });
-      }
-      if (sc.turnComplete) {
-        isAiSpeaking = false;
-        finalizeTranscriptLine('user'); finalizeTranscriptLine('secretary');
-        currentUserLine = ""; currentSecretaryLine = "";
-        if (currentTurnSources.length) { addSourcesLine(currentTurnSources); currentTurnSources = []; }
+  addTranscriptLine('secretary', text);
+  finalizeTranscriptLine('secretary');
+  lastReplyText = text;
+  document.getElementById('replayBtn').style.display = synth ? 'block' : 'none';
+  speakReply_(text);
+});
+function speakReply_(text) {
+  if (!synth) {
+    if (sessionActive && !deliberatelyStopped) { try { recognition.start(); } catch (e) {} }
+    setStatus('Listening…', 'Just talk naturally', 'listening');
+    return;
+  }
+  setStatus('Speaking…', 'The Secretary is replying', 'speaking');
+  function doSpeak() {
+    var utter = new SpeechSynthesisUtterance(text);
+    var finished = false;
+    function done() {
+      if (finished) return; // onend/onerror can both fire in some browsers — only act once
+      finished = true;
+      if (speechWatchdog) { clearTimeout(speechWatchdog); speechWatchdog = null; }
+      if (sessionActive && !deliberatelyStopped) {
+        try { recognition.start(); } catch (e) {}
         setStatus('Listening…', 'Just talk naturally', 'listening');
       }
-      if (sc.interrupted) {
-        isAiSpeaking = false;
-        if (playbackNode) playbackNode.port.postMessage('interrupt');
-      }
     }
-    if (response.error) {
-      showError('Voice service error: ' + (response.error.message || JSON.stringify(response.error)));
-    }
-  };
-
-  ws.onerror = function() {
-    showError('Connection error. Your voice token may have expired (they only last a few minutes) — tap Start again.');
-    endSession();
-  };
-  ws.onclose = function(event) {
-    // 2026-07-26 FIX: this used to call setStatus() with a "Disconnected" message that endSession()
-    // (called on the very next line) immediately overwrote with "Ready" before anyone could read it —
-    // making every failure look like nothing happened at all, a 1-second flash back to idle. Now shows
-    // the real WebSocket close code/reason as a persistent error instead, which also means we can
-    // actually see WHY it closed (e.g. code 1008 usually means the server rejected something in the
-    // setup message) rather than guessing blind.
-    if (sessionActive) {
-      var reason = event.reason || '';
-      var friendly = (reason.indexOf('used too many times') >= 0)
-        ? 'This voice link has been used up. Go back to SurgiLog and tap "Live Voice Conversation" again for a fresh one.'
-        : 'Voice session closed (code ' + event.code + (reason ? ': ' + reason : '') + '). If this keeps happening, go back to SurgiLog and tap "Live Voice Conversation" again for a fresh token.';
-      showError(friendly);
-      endSession();
-    }
-  };
-}
-
-function resampleTo16k_(float32Array, fromRate) {
-  if (fromRate === 16000) return float32Array;
-  var ratio = fromRate / 16000;
-  var newLength = Math.round(float32Array.length / ratio);
-  var result = new Float32Array(newLength);
-  for (var i = 0; i < newLength; i++) {
-    var srcIndex = i * ratio;
-    var srcFloor = Math.floor(srcIndex);
-    var srcCeil = Math.min(srcFloor + 1, float32Array.length - 1);
-    var frac = srcIndex - srcFloor;
-    result[i] = float32Array[srcFloor] * (1 - frac) + float32Array[srcCeil] * frac;
+    utter.onend = done;
+    utter.onerror = done;
+    synth.speak(utter);
+    // 2026-08-01: iOS Safari has a documented failure mode where speak() silently produces no
+    // audio AND never fires onend/onerror. Rather than get stuck on "Speaking..." forever if that
+    // happens, resume listening on our own after a generous timeout — the reply is still fully
+    // visible in the transcript either way, and the 🔊 Replay button below (triggered by a real
+    // tap, which iOS treats far more reliably) is the dependable fallback for actually hearing it.
+    if (speechWatchdog) clearTimeout(speechWatchdog);
+    speechWatchdog = setTimeout(done, Math.max(4000, text.length * 90));
   }
-  return result;
+  // Calling cancel() immediately before speak() is a documented WebKit bug that can silently kill
+  // the very next utterance on iOS — only cancel when something's actually queued, and give WebKit
+  // a beat to actually clear it before speaking again.
+  if (synth.speaking || synth.pending) {
+    try { synth.cancel(); } catch (e) {}
+    setTimeout(doSpeak, 120);
+  } else {
+    doSpeak();
+  }
 }
-
-async function setupAudioPipeline() {
-  // Capture: mic -> 16kHz PCM16 -> base64 -> sent to Gemini
-  captureCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-  await captureCtx.audioWorklet.addModule(blobUrlFor(CAPTURE_WORKLET_SRC));
-  captureNode = new AudioWorkletNode(captureCtx, 'capture-processor');
-  // 2026-07-26 FIX: { sampleRate: 16000 } is only a REQUEST — iOS Safari in particular can silently
-  // substitute the device's own hardware rate (often 48000) instead, with no error or warning. If
-  // that happened here, every previous chunk was labeled 16kHz but wasn't actually — garbled audio
-  // Gemini could open a stable connection to but never usefully understand, which matches a
-  // connection that stays "Listening…" with no error and no reply. Now actually resamples to true
-  // 16kHz before sending, whatever the real captured rate turns out to be.
-  captureNode.port.onmessage = function(e) {
-    if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) {
-      debugStats.wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'null';
-      renderDebug();
-      return;
-    }
-    if (isAiSpeaking) return; // don't send while the Secretary's own reply is playing — prevents it hearing itself
-    var resampled = resampleTo16k_(e.data, captureCtx.sampleRate);
-    var pcm = floatTo16BitPCM(resampled);
-    var b64 = arrayBufferToBase64(pcm);
-    ws.send(JSON.stringify({ realtimeInput: { audio: { data: b64, mimeType: 'audio/pcm;rate=16000' } } }));
-    debugStats.chunksSent++;
-    debugStats.bytesSent += pcm.byteLength;
-    debugStats.wsState = 'OPEN';
-    if (debugStats.chunksSent % 20 === 0) renderDebug(); // don't hammer the DOM every ~8ms chunk
-  };
-  var micSource = captureCtx.createMediaStreamSource(micStream);
-  micSource.connect(captureNode);
-  // Deliberately not connected to destination — connecting would create feedback/echo.
-
-  // Playback: Gemini's 24kHz PCM16 replies -> speakers
-  playbackCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-  await playbackCtx.audioWorklet.addModule(blobUrlFor(PLAYBACK_WORKLET_SRC));
-  playbackNode = new AudioWorkletNode(playbackCtx, 'playback-processor');
-  playbackNode.connect(playbackCtx.destination);
+function replayLastReply_() {
+  // A real tap gesture — far more reliable for actually producing sound on iOS than the
+  // auto-triggered speak() above, which is why this button exists as the dependable fallback.
+  if (lastReplyText) speakReply_(lastReplyText);
 }
-
-function playAudioChunk(base64Audio) {
-  if (!playbackNode) return;
-  if (playbackCtx.state === 'suspended') playbackCtx.resume();
-  var float32 = base64ToFloat32(base64Audio);
-  playbackNode.port.postMessage(float32);
+function primeSpeechSynthesis_() {
+  // "Unlocks" iOS Safari's speech pipeline as early as possible by speaking a single silent
+  // character right away, ideally still within the same tick as page load — the same family of
+  // trick used to unlock WebAudio/video autoplay. Doesn't guarantee every future utterance works
+  // (see the watchdog + manual Replay button above), but reduces how often the very first real
+  // reply is the one that silently fails, which matters here since this page auto-starts without
+  // a direct tap on IT specifically.
+  if (!synth) return;
+  try {
+    var warm = new SpeechSynthesisUtterance(' ');
+    warm.volume = 0;
+    synth.speak(warm);
+  } catch (e) {}
 }
 
 function endSession() {
   sessionActive = false;
+  deliberatelyStopped = true;
+  awaitingReply = false;
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
-  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
-  if (captureCtx) { try { captureCtx.close(); } catch (e) {} captureCtx = null; captureNode = null; }
-  if (playbackCtx) { try { playbackCtx.close(); } catch (e) {} playbackCtx = null; playbackNode = null; }
-  document.getElementById('mainBtn').textContent = 'Start Conversation';
-  document.getElementById('mainBtn').className = 'btn btn-start';
-  document.getElementById('mainBtn').disabled = false;
+  if (recognition) { try { recognition.stop(); } catch (e) {} }
+  if (synth) { try { synth.cancel(); } catch (e) {} }
+  var btn = document.getElementById('mainBtn');
+  if (btn) {
+    btn.textContent = 'Start Conversation';
+    btn.className = 'btn btn-start';
+    btn.disabled = false;
+  }
   if (!document.getElementById('errorBox').style.display || document.getElementById('errorBox').style.display === 'none') {
     setStatus('Ready', 'Tap to start a live conversation', null);
   }
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27 CORRECTED: this was stripped down to skip closing AudioContexts and the wake lock,
-  // reasoning that the page was about to navigate away and the browser would clean those up as part
-  // of normal unload. But navigation was then removed entirely (see below) — the page never unloads
-  // anymore, you just manually switch tabs. That means those audio resources were never being closed
-  // at all: left alive, in the background, indefinitely. iOS is known to aggressively penalize
-  // background tabs holding active microphone/audio sessions — a very plausible explanation for
-  // inconsistent problems specifically around closing, on iOS specifically, not desktop. Back to
-  // full, proper cleanup via endSession() now that there's no navigation left to protect from it.
   try { endSession(); } catch (e) {}
   setStatus('Conversation ended', 'Switch to your SurgiLog tab now (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
 
-// 2026-07-26: auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap —
-// matching how Claude's own Voice Mode works (tap once, immediately listening), not a wake word
-// (which nothing web-based can do — see the chat this came from). If the browser blocks the
-// auto-triggered microphone request (iOS can be strict about requiring a direct tap on THIS page,
-// not just the one that opened it), startSession() already falls back gracefully to a normal
-// tappable "Start Conversation" button via its own existing error handling — never a stuck page.
-if (LIVE_TOKEN) {
-  startSession();
-} else {
-  setStatus('Ready', 'No voice token found — open this page from the SurgiLog Secretary, not directly.', null);
-}
+// Auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap. If the
+// browser blocks the auto-triggered microphone request, startSession() already falls back
+// gracefully to a normal tappable "Start Conversation" button via its own existing error handling
+// — never a stuck page.
+primeSpeechSynthesis_();
+startSession();
 </script>
 </body>
 </html>
