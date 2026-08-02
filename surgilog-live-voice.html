@@ -46,6 +46,9 @@
   .line.user::before { content: "You: "; font-weight: 700; color: #4a6b9c; }
   .line.secretary { color: #1a1a1a; }
   .line.secretary::before { content: "Secretary: "; font-weight: 700; color: #1c4e80; }
+  .line.sources { color: #8899b0; font-size: 11px; margin-top: -4px; margin-bottom: 12px; }
+  .line.sources a { color: #4a6b9c; text-decoration: none; }
+  .line.sources a:not(:last-child)::after { content: " \00b7 "; color: #b7bfcc; }
   .empty { font-size: 12px; color: #b7bfcc; text-align: center; padding: 8px 0; }
 
   .error-box { background: #fde8d8; border: 1px solid #e08a5b; border-radius: 12px; padding: 12px 14px; font-size: 12.5px; color: #8a4b00; margin-top: 14px; display: none; }
@@ -66,6 +69,15 @@
     <div class="substatus" id="substatus">Starting automatically…</div>
     <button class="btn btn-start" id="mainBtn" onclick="toggleSession()">Start Conversation</button>
     <div class="error-box" id="errorBox"></div>
+  </div>
+
+  <!-- 2026-07-28: capture mode only (opened from a field's 🎙 Dictate button) — editable so the
+       person can hand-correct before it goes back to SurgiLog, on top of the auto clean-up that
+       runs there right after. Hidden entirely in normal talk mode. -->
+  <div class="stage" id="captureBox" style="display:none;">
+    <textarea id="captureText" rows="6" style="width:100%; box-sizing:border-box; border:1px solid #dde3ee; border-radius:12px; padding:12px; font-size:14px; font-family:inherit; resize:vertical; margin-bottom:14px;" placeholder="Speak — your words will appear here as you go. You can edit before sending."></textarea>
+    <button class="btn btn-start" id="captureDoneBtn" onclick="sendCaptureResult_()" style="margin-bottom:8px;">✅ Done — Send to SurgiLog</button>
+    <button class="btn" style="background:#eef1f7; color:#445;" onclick="cancelCapture_()">✖ Cancel</button>
   </div>
 
   <div class="transcript" id="debugPanel" style="margin-bottom:16px; display:none;">
@@ -98,6 +110,18 @@ var LIVE_TOKEN = params.get('token') || '';
 var MODEL = params.get('model') || 'gemini-3.1-flash-live-preview';
 var SYSTEM_PROMPT = params.get('prompt') || "You are a helpful assistant.";
 var RETURN_URL = params.get('returnUrl') || '';
+// 2026-07-28: presence of `field` means this page was opened from a specific form field's 🎙
+// Dictate button (see dictationButtonsHtml_ / toggleDictation_ in Index.html) rather than the
+// standalone "Talk to the Secretary" button — same page, same engine, deliberately different mode:
+// silent transcription capture instead of a two-way spoken conversation. session/submitUrl/origin
+// mirror the exact contract the old dictation-helper.html used, so Index.html's existing delivery
+// logic (postMessage + doPost polling fallback) needed no changes at all.
+var CAPTURE_FIELD = params.get('field') || '';
+var CAPTURE_SESSION = params.get('session') || '';
+var SUBMIT_URL = params.get('submitUrl') || '';
+var OPENER_ORIGIN = params.get('origin') || '';
+var IS_CAPTURE_MODE = !!CAPTURE_FIELD;
+var captureTranscript = ''; // accumulates across the whole capture session, not just one turn
 
 var ws = null;
 var micStream = null;
@@ -107,6 +131,7 @@ var sessionActive = false;
 var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
 var wakeLock = null; // keeps the screen from auto-locking during an active conversation — best-effort only
 var currentUserLine = "", currentSecretaryLine = "";
+var currentTurnSources = []; // {title, uri} pairs from Google Search grounding, this turn only
 
 function setStatus(text, sub, mode) {
   document.getElementById('status').textContent = text;
@@ -135,7 +160,7 @@ function addTranscriptLine(speaker, text) {
   div.textContent = text;
   body.appendChild(div);
   // 2026-07-27: cap how many finalized lines stay in the DOM — a much smaller contributor than the
-  // base64 fix above, but the same underlying principle: unbounded growth over a long conversation
+  // base64 fix below, but the same underlying principle: unbounded growth over a long conversation
   // adds up. Keeps roughly the most recent 100 lines, which is already far more than fits on screen.
   while (body.children.length > 100) { body.removeChild(body.firstChild); }
   body.scrollTop = body.scrollHeight;
@@ -143,6 +168,22 @@ function addTranscriptLine(speaker, text) {
 function finalizeTranscriptLine(speaker) {
   var el = document.getElementById('live-' + speaker);
   if (el) el.removeAttribute('id');
+}
+function addSourcesLine(sources) {
+  // Small, skippable line under a grounded reply — just enough to show it wasn't recalled from
+  // memory, without turning the transcript into a bibliography. Capped at 3 links.
+  var body = document.getElementById('transcriptBody');
+  var div = document.createElement('div');
+  div.className = 'line sources';
+  sources.slice(0, 3).forEach(function(s) {
+    var a = document.createElement('a');
+    a.href = s.uri; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    a.textContent = s.title;
+    div.appendChild(a);
+  });
+  body.appendChild(div);
+  while (body.children.length > 100) { body.removeChild(body.firstChild); }
+  body.scrollTop = body.scrollHeight;
 }
 
 // ---------- Audio worklets, loaded from in-memory Blob URLs (keeps this a single file) ----------
@@ -248,15 +289,43 @@ async function startSession() {
     //      back: Unknown name "config": Cannot find field.
     //   2. responseModalities lives inside a nested "generationConfig" object, not as a sibling of
     //      "model" and "systemInstruction".
-    // inputAudioTranscription/outputAudioTranscription ARE real, valid fields per this same
-    // reference (unlike the token endpoint's liveConnectConstraints, which genuinely doesn't exist)
-    // — left out for now on purpose, to isolate whether this structural fix alone gets the core
-    // connection working before adding anything back.
-    var setupMessage = {
+    // 2026-07-28 CORRECTED (real production error, not a guess): inputAudioTranscription and
+    // outputAudioTranscription are fields of BidiGenerateContentSetup itself — SIBLINGS of
+    // generationConfig, NOT nested inside it. Nesting them inside generationConfig gets the whole
+    // setup message rejected outright (code 1007, "Unknown name inputAudioTranscription ... Cannot
+    // find field"), which kills the session before anything else can even start. Confirmed against
+    // the official field table at ai.google.dev/api/live#BidiGenerateContentSetup — model,
+    // generationConfig, systemInstruction, tools, inputAudioTranscription, outputAudioTranscription
+    // are all top-level fields of `setup`.
+    var setupMessage = IS_CAPTURE_MODE ? {
+      // 2026-07-28: capture mode (opened from a field's 🎙 Dictate button) — TEXT modality only
+      // (no spoken reply, cheaper), no search tool (not needed, keeps behavior predictable for a
+      // clinical record), input transcription on since that's the entire point of this mode.
+      setup: {
+        model: 'models/' + MODEL,
+        generationConfig: { responseModalities: ['TEXT'] },
+        inputAudioTranscription: {},
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
+      }
+    } : {
       setup: {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        // 2026-07-28 CORRECTED: was snake_case google_search — the actual JSON wire field is
+        // camelCase googleSearch (the Python SDK's google_search naming is a Python-only
+        // convention, not the wire format; confirmed against ai.google.dev's own JS example:
+        // tools: [{ googleSearch: {} }]). The wrong name didn't error like the transcription fields
+        // did above, so it was very likely just silently ignored as an unrecognized field this
+        // whole time — meaning search grounding probably wasn't actually running even though
+        // nothing looked broken. Lets the Secretary look things up in real time (medical
+        // guidelines, current info, anything) instead of only knowing the app and whatever's in its
+        // training data — the model decides for itself when a query actually needs a search versus
+        // just answering directly. If this ever starts erroring on setup, check that MODEL still
+        // supports googleSearch grounding in Live sessions.
+        tools: [{ googleSearch: {} }]
       }
     };
     ws.send(JSON.stringify(setupMessage));
@@ -267,7 +336,8 @@ async function startSession() {
       document.getElementById('mainBtn').className = 'btn btn-end';
       document.getElementById('mainBtn').disabled = false;
       var rateNote = (captureCtx.sampleRate !== 16000) ? ' (mic ran at ' + captureCtx.sampleRate + 'Hz, resampled to 16kHz)' : '';
-      setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening');
+      if (IS_CAPTURE_MODE) { setStatus('Listening…', 'Dictate now' + rateNote, 'listening'); }
+      else { setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening'); }
       debugStats.wsState = 'OPEN';
       renderDebug();
     } catch (audioErr) {
@@ -306,6 +376,21 @@ async function startSession() {
     if (response.setupComplete) return;
     if (response.serverContent) {
       var sc = response.serverContent;
+      if (IS_CAPTURE_MODE) {
+        // Capture mode: ignore anything the model says back (TEXT modality means there's no audio
+        // to play anyway) — the only thing that matters here is the user's own speech, transcribed.
+        if (sc.inputTranscription && sc.inputTranscription.text) {
+          captureTranscript += sc.inputTranscription.text;
+          updateCaptureBox_();
+        }
+        if (sc.turnComplete) {
+          // Add a space so the next utterance doesn't run into this one, then keep listening —
+          // capture mode stays open across many pauses until the user taps Done.
+          if (captureTranscript && !/\s$/.test(captureTranscript)) captureTranscript += ' ';
+          setStatus('Listening…', 'Dictate now — tap Done when finished', 'listening');
+        }
+        return;
+      }
       if (sc.modelTurn && sc.modelTurn.parts) {
         sc.modelTurn.parts.forEach(function(part) {
           if (part.inlineData && part.inlineData.data) {
@@ -330,10 +415,24 @@ async function startSession() {
         currentSecretaryLine += sc.outputTranscription.text;
         addTranscriptLine('secretary', currentSecretaryLine);
       }
+      // 2026-07-28: when Google Search grounding fires, groundingChunks show up here with a title
+      // + uri per source the model actually drew on. Just collecting them as they stream in —
+      // rendered once, at turnComplete, so it appears as one tidy line under the reply rather than
+      // flickering mid-sentence.
+      var gm = sc.groundingMetadata;
+      if (gm && Array.isArray(gm.groundingChunks)) {
+        gm.groundingChunks.forEach(function(chunk) {
+          if (chunk.web && chunk.web.uri) {
+            var already = currentTurnSources.some(function(s){ return s.uri === chunk.web.uri; });
+            if (!already) currentTurnSources.push({ title: chunk.web.title || 'source', uri: chunk.web.uri });
+          }
+        });
+      }
       if (sc.turnComplete) {
         isAiSpeaking = false;
         finalizeTranscriptLine('user'); finalizeTranscriptLine('secretary');
         currentUserLine = ""; currentSecretaryLine = "";
+        if (currentTurnSources.length) { addSourcesLine(currentTurnSources); currentTurnSources = []; }
         setStatus('Listening…', 'Just talk naturally', 'listening');
       }
       if (sc.interrupted) {
@@ -444,22 +543,68 @@ function endSession() {
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27 FINAL: every attempt at automated return — window.close(), direct navigation, a
-  // delayed navigation, a stripped-down pre-navigation cleanup — has either failed outright or made
-  // things worse (the WebKit crash-reload, the mic prompt reappearing on its own). That pattern
-  // means the attempt itself is very likely the problem, on this specific device, not any particular
-  // implementation of it. Stopping here: no navigation attempt of any kind. Just stop the session
-  // immediately and tell you clearly to switch tabs — nothing else running afterward that could
-  // trigger a side effect.
-  sessionActive = false;
-  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
-  var btn = document.getElementById('mainBtn');
-  if (btn) { btn.textContent = 'Start Conversation'; btn.className = 'btn btn-start'; }
+  // 2026-07-27 CORRECTED: this was stripped down to skip closing AudioContexts and the wake lock,
+  // reasoning that the page was about to navigate away and the browser would clean those up as part
+  // of normal unload. But navigation was then removed entirely (see below) — the page never unloads
+  // anymore, you just manually switch tabs. That means those audio resources were never being closed
+  // at all: left alive, in the background, indefinitely. iOS is known to aggressively penalize
+  // background tabs holding active microphone/audio sessions — a very plausible explanation for
+  // inconsistent problems specifically around closing, on iOS specifically, not desktop. Back to
+  // full, proper cleanup via endSession() now that there's no navigation left to protect from it.
+  try { endSession(); } catch (e) {}
   setStatus('Conversation ended', 'Switch to your SurgiLog tab now (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
 window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
+
+// 2026-07-28: capture mode swaps the header copy and shows the editable transcript box instead of
+// the normal talk-mode transcript/debug panels — same page, same auto-start-on-load behavior below,
+// just a different job once connected.
+function initCaptureModeUi_() {
+  if (!IS_CAPTURE_MODE) return;
+  document.querySelector('.header h1').textContent = '🎙️ Secretary — Dictate';
+  document.querySelector('.header p').textContent = 'Speak naturally — tap Done when finished, then vet it back in SurgiLog before saving.';
+  document.getElementById('captureBox').style.display = 'block';
+  document.getElementById('mainBtn').style.display = 'none'; // capture auto-starts; Done/Cancel replace Start/End
+  var transcriptPanels = document.querySelectorAll('.transcript');
+  transcriptPanels.forEach(function(p) { p.style.display = 'none'; }); // no talk transcript/sources here
+}
+function updateCaptureBox_() {
+  var ta = document.getElementById('captureText');
+  // Don't stomp on manual edits mid-dictation: only auto-append if the box still matches what we
+  // last wrote — if the person has started hand-editing, leave it alone and let them keep typing.
+  if (ta.dataset.lastAuto === undefined || ta.value === ta.dataset.lastAuto) {
+    ta.value = captureTranscript;
+    ta.dataset.lastAuto = captureTranscript;
+    ta.scrollTop = ta.scrollHeight;
+  }
+}
+function sendCaptureResult_() {
+  var text = (document.getElementById('captureText').value || '').trim();
+  try { endSession(); } catch (e) {}
+  if (!text) { setStatus('Nothing to send', 'Dictate something first, or tap Cancel', null); return; }
+  var delivered = false;
+  if (window.opener) {
+    try { window.opener.postMessage({ source: 'surgilog_dictation', text: text }, OPENER_ORIGIN || '*'); delivered = true; } catch (e) {}
+  }
+  // Fallback POST — same doPost contract dictation-helper.html always used, matters most when
+  // SurgiLog is running as an iOS Home Screen app, where window.opener often isn't available.
+  if (SUBMIT_URL && CAPTURE_SESSION) {
+    try {
+      fetch(SUBMIT_URL, { method: 'POST', mode: 'no-cors', body: JSON.stringify({ session: CAPTURE_SESSION, text: text }) });
+      delivered = true;
+    } catch (e) {}
+  }
+  setStatus(delivered ? 'Sent ✓' : 'Couldn\u2019t deliver', delivered ? 'Switch back to SurgiLog \u2014 it\u2019s already there' : 'Copy the text manually and switch back to SurgiLog', null);
+  document.getElementById('captureDoneBtn').disabled = true;
+  setTimeout(function() { try { window.close(); } catch (e) {} }, 400);
+}
+function cancelCapture_() {
+  try { endSession(); } catch (e) {}
+  try { window.close(); } catch (e) {}
+  setStatus('Cancelled', 'Switch back to SurgiLog \u2014 nothing was sent', null);
+}
+initCaptureModeUi_();
 
 // 2026-07-26: auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap —
 // matching how Claude's own Voice Mode works (tap once, immediately listening), not a wake word
