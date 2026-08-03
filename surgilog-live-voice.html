@@ -256,7 +256,11 @@ async function startSession() {
       setup: {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        // 2026-08-03 FIX: Live Voice had no tools field at all, so unlike the typed-chat path in
+        // Code.gs (callGemini_, added 2026-08-02) it had no live search grounding and was answering
+        // purely from training data. Matches the same tools shape used there — camelCase googleSearch.
+        tools: [{ googleSearch: {} }]
       }
     };
     ws.send(JSON.stringify(setupMessage));
