@@ -26,6 +26,7 @@
     transition: all 0.25s ease;
   }
   .orb.listening { background: #e5f7ea; border-color: #7ed49a; box-shadow: 0 0 0 8px rgba(126,212,154,0.25); }
+  .orb.thinking { background: #eef0ff; border-color: #a9b4f0; box-shadow: 0 0 0 8px rgba(169,180,240,0.25); }
   .orb.speaking { background: #fff4e2; border-color: #f0c987; box-shadow: 0 0 0 8px rgba(240,201,135,0.25); }
   .orb.error { background: #fde8d8; border-color: #e08a5b; }
   .status { font-size: 14px; font-weight: 700; color: #1c4e80; margin-bottom: 4px; }
@@ -36,7 +37,7 @@
     font-size: 15px; font-weight: 700; cursor: pointer; width: 100%;
   }
   .btn-start { background: #1F3864; color: #fff; }
-  .btn-end { background: #c0392b; color: #fff; }
+  .btn-recording { background: #c0392b; color: #fff; }
   .btn:disabled { opacity: 0.5; }
 
   .transcript { background: #fff; border-radius: 16px; padding: 14px 16px; max-height: 240px; overflow-y: auto; }
@@ -57,62 +58,122 @@
     <div class="tag" style="cursor:pointer; text-decoration:underline;" onclick="endConversationAndReturn()">End &amp; show me how to get back</div>
     <div style="font-size:11px; color:#8ca3c9; margin-top:4px;">This opened in a new tab — your SurgiLog tab is still open behind it, untouched, the whole time. When you're done here, switch tabs (swipe up, or your open-tabs button) to go back to it — that's the only way back, and it always works.</div>
     <h1>🎙️ Live Voice</h1>
-    <p>Talk naturally — the Secretary will respond out loud.</p>
+    <p>Tap, ask your question, tap again — the Secretary will respond out loud.</p>
   </div>
 
   <div class="stage">
     <div class="orb" id="orb">🎙️</div>
-    <div class="status" id="status">Connecting…</div>
-    <div class="substatus" id="substatus">Starting automatically…</div>
-    <button class="btn btn-start" id="mainBtn" onclick="toggleSession()">Start Conversation</button>
+    <div class="status" id="status">Ready</div>
+    <div class="substatus" id="substatus">Tap to ask a question</div>
+    <button class="btn btn-start" id="mainBtn" onclick="toggleRecording()">Tap to Talk</button>
     <div class="error-box" id="errorBox"></div>
-  </div>
-
-  <div class="transcript" id="debugPanel" style="margin-bottom:16px; display:none;">
-    <div class="transcript-label">Diagnostics</div>
-    <div id="debugBody" style="font-size:12px; color:#4a5568; line-height:1.7;"></div>
   </div>
 
   <div class="transcript">
     <div class="transcript-label">Transcript</div>
-    <div id="transcriptBody"><div class="empty">Nothing said yet</div></div>
+    <div id="transcriptBody"><div class="empty">Nothing asked yet</div></div>
   </div>
 </div>
 
-<script>
-// Real counters instead of guessing — shows exactly which stage of the pipeline is actually
-// running: mic capturing, chunks reaching the server, and anything at all coming back.
-var debugStats = { chunksSent: 0, bytesSent: 0, messagesReceived: 0, lastMessageType: 'none', wsState: '-' };
-function renderDebug() {
-  document.getElementById('debugPanel').style.display = 'block';
-  document.getElementById('debugBody').innerHTML =
-    'WebSocket state: ' + debugStats.wsState + '<br>' +
-    'Audio chunks sent: ' + debugStats.chunksSent + ' (' + debugStats.bytesSent + ' bytes total)<br>' +
-    'Messages received from server: ' + debugStats.messagesReceived + '<br>' +
-    'Last message type: ' + debugStats.lastMessageType;
+<script type="module">
+// 2026-08-04: Kokoro TTS, running 100% in this browser tab — no server call, no account, no card, no
+// quota, ever. This is a genuinely different category from every other tier: ElevenLabs and browser
+// SpeechSynthesis both still work exactly as before and are untouched below — this block only ever
+// ADDS a chance to skip them entirely by speaking locally first. Deliberately isolated in its own
+// <script type="module"> and communicating with the main script through exactly one function
+// (window.__tryKokoroSpeak_) and one flag (window.__kokoroReady_), so if anything in here breaks —
+// wrong import, WebGPU unsupported, model fails to load — the existing chain below is completely
+// unaffected and just runs as it always has.
+window.__kokoroReady_ = false;
+window.__kokoroTts_ = null;
+
+(async function initKokoro_() {
+  try {
+    var mod = await import("https://cdn.jsdelivr.net/npm/kokoro-js@1.2.0/+esm");
+    var KokoroTTS = mod.KokoroTTS;
+    var hasWebGPU = !!(navigator.gpu);
+    // fp32 is recommended alongside webgpu; q8 is the lighter-weight choice for wasm-only devices —
+    // see kokoro-js's own docs for this exact pairing.
+    window.__kokoroTts_ = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
+      dtype: hasWebGPU ? "fp32" : "q8",
+      device: hasWebGPU ? "webgpu" : "wasm"
+    });
+    window.__kokoroReady_ = true;
+  } catch (e) {
+    // Deliberately silent — this is tier 1 of 3. Anything from here on just means tier 2
+    // (ElevenLabs) or tier 3 (browser TTS) handles it instead, exactly as they did before tonight.
+    window.__kokoroReady_ = false;
+  }
+})();
+
+// Manually builds a playable WAV Blob from raw samples, rather than relying on a library-specific
+// convenience method (e.g. a Node-only .save()) that may not exist in every kokoro-js version —
+// this is a standard, version-independent technique.
+function pcmToWavBlob_(samples, sampleRate) {
+  var buffer = new ArrayBuffer(44 + samples.length * 2);
+  var view = new DataView(buffer);
+  function writeStr(offset, str) { for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+  writeStr(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); writeStr(8, "WAVE");
+  writeStr(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeStr(36, "data"); view.setUint32(40, samples.length * 2, true);
+  var offset = 44;
+  for (var i = 0; i < samples.length; i++, offset += 2) {
+    var s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
 }
 
-// ---------- Config passed in from SurgiLog ----------
+// The one thing the main script calls. Returns true if it actually spoke the text (main script should
+// stop there), false if it couldn't (main script should fall through to ElevenLabs/browser TTS).
+window.__tryKokoroSpeak_ = async function(text) {
+  if (!window.__kokoroReady_ || !window.__kokoroTts_) return false;
+  try {
+    var result = await window.__kokoroTts_.generate(text, { voice: "af_heart" });
+    var blob = (result.toBlob) ? result.toBlob() : pcmToWavBlob_(result.audio, result.sampling_rate || 24000);
+    var url = URL.createObjectURL(blob);
+    var audio = new Audio(url);
+    await new Promise(function(resolve) {
+      audio.onended = resolve;
+      audio.onerror = resolve;
+      audio.play().catch(resolve);
+    });
+    URL.revokeObjectURL(url);
+    return true;
+  } catch (e) {
+    return false; // falls through to tier 2/3 below, same as if Kokoro were never available
+  }
+};
+</script>
+
+<script>
+// 2026-08-03: SECOND architecture change tonight. The Gemini Live API's own free-tier session quota
+// turned out to be tiny and shared across all ~28 staff on one API key — confirmed by a real
+// "exceeded your current quota" WebSocket close. This page no longer streams audio over a live
+// WebSocket at all. New shape: push-to-talk. Tap, record a clip, tap again to send it, wait for a
+// reply, hear it spoken back. Less fluid than a live open mic, but nothing here depends on a quota
+// that can run out mid-shift — see liveVoiceLookup_impl_ in Code.gs for the Gemini-primary/
+// Groq-fallback answering logic, and liveVoiceSpeak_impl_ for the ElevenLabs (browser-TTS-fallback) voice output.
+// 2026-08-04: voice output is now THREE tiers — Kokoro (100% in-browser, see the module script just
+// above) tried first, falling through to this file's existing ElevenLabs call, falling through again
+// to browser SpeechSynthesis, exactly as before. See speakAnswer_ below for where tier 1 is tried.
+
 var params = new URLSearchParams(window.location.search);
-var LIVE_TOKEN = params.get('token') || '';
-var MODEL = params.get('model') || 'gemini-3.1-flash-live-preview';
-var SYSTEM_PROMPT = params.get('prompt') || "You are a helpful assistant.";
+var SESSION_TOKEN = params.get('session') || '';
 var RETURN_URL = params.get('returnUrl') || '';
 
-var ws = null;
+var mediaRecorder = null;
+var recordedChunks = [];
 var micStream = null;
-var captureCtx = null, captureNode = null;
-var playbackCtx = null, playbackNode = null;
-var sessionActive = false;
-var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
-var wakeLock = null; // keeps the screen from auto-locking during an active conversation — best-effort only
-var currentUserLine = "", currentSecretaryLine = "";
+var isRecording = false;
+var isBusy = false; // true from the moment recording stops until the reply has finished playing — blocks a second tap mid-flight
 
 function setStatus(text, sub, mode) {
   document.getElementById('status').textContent = text;
   document.getElementById('substatus').textContent = sub || '';
-  var orb = document.getElementById('orb');
-  orb.className = 'orb' + (mode ? ' ' + mode : '');
+  document.getElementById('orb').className = 'orb' + (mode ? ' ' + mode : '');
 }
 function showError(msg) {
   var box = document.getElementById('errorBox');
@@ -127,350 +188,182 @@ function addTranscriptLine(speaker, text) {
   var body = document.getElementById('transcriptBody');
   var empty = body.querySelector('.empty');
   if (empty) empty.remove();
-  var existing = document.getElementById('live-' + speaker);
-  if (existing) { existing.textContent = text; return; }
   var div = document.createElement('div');
   div.className = 'line ' + speaker;
-  div.id = 'live-' + speaker;
   div.textContent = text;
   body.appendChild(div);
-  // 2026-07-27: cap how many finalized lines stay in the DOM — a much smaller contributor than the
-  // base64 fix above, but the same underlying principle: unbounded growth over a long conversation
-  // adds up. Keeps roughly the most recent 100 lines, which is already far more than fits on screen.
-  while (body.children.length > 100) { body.removeChild(body.firstChild); }
+  while (body.children.length > 100) { body.removeChild(body.firstChild); } // same cap as before, unbounded growth over a long shift adds up
   body.scrollTop = body.scrollHeight;
 }
-function finalizeTranscriptLine(speaker) {
-  var el = document.getElementById('live-' + speaker);
-  if (el) el.removeAttribute('id');
-}
 
-// ---------- Audio worklets, loaded from in-memory Blob URLs (keeps this a single file) ----------
-var CAPTURE_WORKLET_SRC = "class CaptureProcessor extends AudioWorkletProcessor {" +
-  "process(inputs) {" +
-  "  var input = inputs[0];" +
-  "  if (input && input[0] && input[0].length) { this.port.postMessage(input[0].slice()); }" +
-  "  return true;" +
-  "}}" +
-  "registerProcessor('capture-processor', CaptureProcessor);";
-
-var PLAYBACK_WORKLET_SRC = "class PlaybackProcessor extends AudioWorkletProcessor {" +
-  "constructor() { super(); this.queue = []; this.offset = 0;" +
-  "  this.port.onmessage = (e) => {" +
-  "    if (e.data === 'interrupt') { this.queue = []; this.offset = 0; }" +
-  "    else { this.queue.push(e.data); }" +
-  "  };" +
-  "}" +
-  "process(inputs, outputs) {" +
-  "  var output = outputs[0][0];" +
-  "  for (var i = 0; i < output.length; i++) {" +
-  "    if (this.queue.length === 0) { output[i] = 0; continue; }" +
-  "    var chunk = this.queue[0];" +
-  "    output[i] = chunk[this.offset++];" +
-  "    if (this.offset >= chunk.length) { this.queue.shift(); this.offset = 0; }" +
-  "  }" +
-  "  return true;" +
-  "}}" +
-  "registerProcessor('playback-processor', PlaybackProcessor);";
-
-function blobUrlFor(src) {
-  return URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-}
-
-// ---------- PCM <-> base64 helpers ----------
-function floatTo16BitPCM(float32Array) {
-  var out = new Int16Array(float32Array.length);
-  for (var i = 0; i < float32Array.length; i++) {
-    var s = Math.max(-1, Math.min(1, float32Array[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out.buffer;
-}
-function arrayBufferToBase64(buffer) {
-  // 2026-07-27 FIX: was building this string one character at a time in a loop — for a chunk this
-  // small (~256 bytes) that's not the bottleneck on its own, but this runs ~125 times/second for the
-  // entire conversation, so it adds up to millions of small string allocations over several minutes.
-  // Real, measurable CPU/memory churn on top of everything else running concurrently (WebSocket,
-  // audio worklets, DOM updates) — plausibly part of what pushes memory pressure high enough for iOS
-  // to kill the page's process on a longer conversation. Bulk conversion in one call instead.
-  var bytes = new Uint8Array(buffer);
-  var binary = String.fromCharCode.apply(null, bytes);
-  return window.btoa(binary);
-}
-function base64ToFloat32(base64) {
-  var binary = atob(base64);
-  var bytes = new Uint8Array(binary.length);
-  for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  var int16 = new Int16Array(bytes.buffer);
-  var float32 = new Float32Array(int16.length);
-  for (var j = 0; j < int16.length; j++) float32[j] = int16[j] / 32768;
-  return float32;
-}
-
-// ---------- Main session control ----------
-function toggleSession() {
-  if (sessionActive) { endConversationAndReturn(); } else { startSession(); }
-}
-
-async function startSession() {
-  clearError();
-  isAiSpeaking = false;
-  if (!LIVE_TOKEN) { showError('No voice token was passed in. Open this page from the SurgiLog Secretary, not directly.'); return; }
-  document.getElementById('mainBtn').disabled = true;
-  setStatus('Connecting…', 'Setting up microphone and connection', null);
-  // 2026-07-27: can't keep the conversation running with the screen fully OFF — iOS suspends both
-  // the WebSocket and the microphone the instant the screen locks, a real platform restriction, not
-  // something fixable here. This is the honest next-best thing: stop the screen from auto-locking
-  // WHILE a conversation is active, so at least it won't cut out just from sitting untouched for a
-  // few seconds. Not supported on every browser, and best-effort even where it is — never treated
-  // as required for the conversation itself to work.
-  try {
-    if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
-  } catch (e) { wakeLock = null; }
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-  } catch (e) {
-    showError('Microphone access was blocked or denied. Check your browser permissions and try again.');
-    document.getElementById('mainBtn').disabled = false;
-    return;
-  }
-
-  var wsUrl = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=' + encodeURIComponent(LIVE_TOKEN);
-  ws = new WebSocket(wsUrl);
-
-  ws.onopen = async function() {
-    // 2026-07-26 FIX: confirmed against the authoritative schema at ai.google.dev/api/live (the
-    // low-level field-by-field reference, not just the getting-started example, which turned out to
-    // be simplified/inconsistent in two ways):
-    //   1. The top-level wrapper key must be "setup", not "config" — matches the exact error we got
-    //      back: Unknown name "config": Cannot find field.
-    //   2. responseModalities lives inside a nested "generationConfig" object, not as a sibling of
-    //      "model" and "systemInstruction".
-    // inputAudioTranscription/outputAudioTranscription ARE real, valid fields per this same
-    // reference (unlike the token endpoint's liveConnectConstraints, which genuinely doesn't exist)
-    // — left out for now on purpose, to isolate whether this structural fix alone gets the core
-    // connection working before adding anything back.
-    var setupMessage = {
-      setup: {
-        model: 'models/' + MODEL,
-        generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
-      }
+function blobToBase64_(blob) {
+  return new Promise(function(resolve, reject) {
+    var reader = new FileReader();
+    reader.onloadend = function() {
+      // reader.result is "data:audio/webm;base64,AAAA..." — strip the prefix, keep just the base64
+      var b64 = String(reader.result).split(',')[1] || '';
+      resolve(b64);
     };
-    ws.send(JSON.stringify(setupMessage));
-    try {
-      await setupAudioPipeline();
-      sessionActive = true;
-      document.getElementById('mainBtn').textContent = 'End Conversation';
-      document.getElementById('mainBtn').className = 'btn btn-end';
-      document.getElementById('mainBtn').disabled = false;
-      var rateNote = (captureCtx.sampleRate !== 16000) ? ' (mic ran at ' + captureCtx.sampleRate + 'Hz, resampled to 16kHz)' : '';
-      setStatus('Listening…', 'Just talk naturally' + rateNote, 'listening');
-      debugStats.wsState = 'OPEN';
-      renderDebug();
-    } catch (audioErr) {
-      showError('Connected, but audio setup failed: ' + audioErr.message);
-      document.getElementById('mainBtn').disabled = false;
-    }
-  };
-
-  ws.onmessage = function(event) {
-    // 2026-07-26 FIX: event.data can be a string (text frame) OR a Blob (binary frame) — the old
-    // code only ever tried JSON.parse(event.data) directly, which throws immediately on a Blob and
-    // was silently swallowed by the catch block. That would perfectly explain audio going out fine
-    // (1260 chunks sent, connection healthy) while messagesReceived stayed frozen at 0 — every
-    // incoming message may have been silently dropped before we ever looked at it. Now handles both
-    // frame types, and shows a parse failure on screen instead of hiding it.
-    if (event.data instanceof Blob) {
-      event.data.text().then(handleServerMessage).catch(function(e) {
-        debugStats.lastMessageType = 'BLOB READ ERROR: ' + e.message;
-        renderDebug();
-      });
-    } else {
-      handleServerMessage(event.data);
-    }
-  };
-  function handleServerMessage(raw) {
-    var response;
-    try { response = JSON.parse(raw); } catch (e) {
-      debugStats.messagesReceived++;
-      debugStats.lastMessageType = 'PARSE FAILED: ' + e.message;
-      renderDebug();
-      return;
-    }
-    debugStats.messagesReceived++;
-    debugStats.lastMessageType = Object.keys(response).join(',') || 'empty';
-    renderDebug();
-    if (response.setupComplete) return;
-    if (response.serverContent) {
-      var sc = response.serverContent;
-      if (sc.modelTurn && sc.modelTurn.parts) {
-        sc.modelTurn.parts.forEach(function(part) {
-          if (part.inlineData && part.inlineData.data) {
-            // 2026-07-27 FIX: browser echoCancellation is only a best-effort hint, and it doesn't
-            // reliably track audio played back through the raw Web Audio API the way it tracks a
-            // normal <audio> element — this page's own speech was getting picked back up by the
-            // mic and misread as user speech (and even triggering the API's own "interrupted"
-            // handling on its own echoed voice). Suppressing outgoing mic audio while the
-            // Secretary's own reply is actively playing removes that path at the source, instead
-            // of hoping the browser's AEC catches it.
-            isAiSpeaking = true;
-            playAudioChunk(part.inlineData.data);
-            setStatus('Speaking…', 'The Secretary is replying', 'speaking');
-          }
-        });
-      }
-      if (sc.inputTranscription && sc.inputTranscription.text) {
-        currentUserLine += sc.inputTranscription.text;
-        addTranscriptLine('user', currentUserLine);
-      }
-      if (sc.outputTranscription && sc.outputTranscription.text) {
-        currentSecretaryLine += sc.outputTranscription.text;
-        addTranscriptLine('secretary', currentSecretaryLine);
-      }
-      if (sc.turnComplete) {
-        isAiSpeaking = false;
-        finalizeTranscriptLine('user'); finalizeTranscriptLine('secretary');
-        currentUserLine = ""; currentSecretaryLine = "";
-        setStatus('Listening…', 'Just talk naturally', 'listening');
-      }
-      if (sc.interrupted) {
-        isAiSpeaking = false;
-        if (playbackNode) playbackNode.port.postMessage('interrupt');
-      }
-    }
-    if (response.error) {
-      showError('Voice service error: ' + (response.error.message || JSON.stringify(response.error)));
-    }
-  };
-
-  ws.onerror = function() {
-    showError('Connection error. Your voice token may have expired (they only last a few minutes) — tap Start again.');
-    endSession();
-  };
-  ws.onclose = function(event) {
-    // 2026-07-26 FIX: this used to call setStatus() with a "Disconnected" message that endSession()
-    // (called on the very next line) immediately overwrote with "Ready" before anyone could read it —
-    // making every failure look like nothing happened at all, a 1-second flash back to idle. Now shows
-    // the real WebSocket close code/reason as a persistent error instead, which also means we can
-    // actually see WHY it closed (e.g. code 1008 usually means the server rejected something in the
-    // setup message) rather than guessing blind.
-    if (sessionActive) {
-      var reason = event.reason || '';
-      var friendly = (reason.indexOf('used too many times') >= 0)
-        ? 'This voice link has been used up. Go back to SurgiLog and tap "Live Voice Conversation" again for a fresh one.'
-        : 'Voice session closed (code ' + event.code + (reason ? ': ' + reason : '') + '). If this keeps happening, go back to SurgiLog and tap "Live Voice Conversation" again for a fresh token.';
-      showError(friendly);
-      endSession();
-    }
-  };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
-function resampleTo16k_(float32Array, fromRate) {
-  if (fromRate === 16000) return float32Array;
-  var ratio = fromRate / 16000;
-  var newLength = Math.round(float32Array.length / ratio);
-  var result = new Float32Array(newLength);
-  for (var i = 0; i < newLength; i++) {
-    var srcIndex = i * ratio;
-    var srcFloor = Math.floor(srcIndex);
-    var srcCeil = Math.min(srcFloor + 1, float32Array.length - 1);
-    var frac = srcIndex - srcFloor;
-    result[i] = float32Array[srcFloor] * (1 - frac) + float32Array[srcCeil] * frac;
+function toggleRecording() {
+  if (isBusy) return; // ignore taps while a previous question is still being answered/spoken
+  if (isRecording) { stopRecording(); } else { startRecording(); }
+}
+
+async function startRecording() {
+  clearError();
+  try {
+    if (!micStream) {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    // 2026-08-03: iOS Safari's MediaRecorder support for exact mime types varies by version — try the
+    // preferred type first, fall back to letting the browser pick its own default rather than throwing.
+    var mimeType = 'audio/webm';
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && !MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
+    }
+    recordedChunks = [];
+    mediaRecorder = mimeType ? new MediaRecorder(micStream, { mimeType: mimeType }) : new MediaRecorder(micStream);
+    mediaRecorder.ondataavailable = function(e) { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = handleRecordingStopped_;
+    mediaRecorder.start();
+    isRecording = true;
+    document.getElementById('mainBtn').textContent = 'Tap When Done';
+    document.getElementById('mainBtn').className = 'btn btn-recording';
+    setStatus('Listening…', 'Tap again when you\u2019re finished asking', 'listening');
+  } catch (e) {
+    showError('Couldn\u2019t access the microphone: ' + e.message + '. Check Safari\u2019s microphone permission for this site.');
   }
-  return result;
 }
 
-async function setupAudioPipeline() {
-  // Capture: mic -> 16kHz PCM16 -> base64 -> sent to Gemini
-  captureCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-  await captureCtx.audioWorklet.addModule(blobUrlFor(CAPTURE_WORKLET_SRC));
-  captureNode = new AudioWorkletNode(captureCtx, 'capture-processor');
-  // 2026-07-26 FIX: { sampleRate: 16000 } is only a REQUEST — iOS Safari in particular can silently
-  // substitute the device's own hardware rate (often 48000) instead, with no error or warning. If
-  // that happened here, every previous chunk was labeled 16kHz but wasn't actually — garbled audio
-  // Gemini could open a stable connection to but never usefully understand, which matches a
-  // connection that stays "Listening…" with no error and no reply. Now actually resamples to true
-  // 16kHz before sending, whatever the real captured rate turns out to be.
-  captureNode.port.onmessage = function(e) {
-    if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) {
-      debugStats.wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'null';
-      renderDebug();
+function stopRecording() {
+  if (mediaRecorder && isRecording) {
+    isRecording = false;
+    isBusy = true;
+    document.getElementById('mainBtn').disabled = true;
+    document.getElementById('mainBtn').textContent = 'Tap to Talk';
+    document.getElementById('mainBtn').className = 'btn btn-start';
+    setStatus('Thinking…', 'Looking that up for you', 'thinking');
+    mediaRecorder.stop();
+  }
+}
+
+async function handleRecordingStopped_() {
+  try {
+    var mimeType = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
+    var blob = new Blob(recordedChunks, { type: mimeType });
+    recordedChunks = [];
+    if (blob.size < 500) { // essentially silence/empty tap — nothing worth sending
+      showError('Didn\u2019t catch anything \u2014 try again and speak right after tapping.');
+      resetToReady_();
       return;
     }
-    if (isAiSpeaking) return; // don't send while the Secretary's own reply is playing — prevents it hearing itself
-    var resampled = resampleTo16k_(e.data, captureCtx.sampleRate);
-    var pcm = floatTo16BitPCM(resampled);
-    var b64 = arrayBufferToBase64(pcm);
-    ws.send(JSON.stringify({ realtimeInput: { audio: { data: b64, mimeType: 'audio/pcm;rate=16000' } } }));
-    debugStats.chunksSent++;
-    debugStats.bytesSent += pcm.byteLength;
-    debugStats.wsState = 'OPEN';
-    if (debugStats.chunksSent % 20 === 0) renderDebug(); // don't hammer the DOM every ~8ms chunk
-  };
-  var micSource = captureCtx.createMediaStreamSource(micStream);
-  micSource.connect(captureNode);
-  // Deliberately not connected to destination — connecting would create feedback/echo.
-
-  // Playback: Gemini's 24kHz PCM16 replies -> speakers
-  playbackCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-  await playbackCtx.audioWorklet.addModule(blobUrlFor(PLAYBACK_WORKLET_SRC));
-  playbackNode = new AudioWorkletNode(playbackCtx, 'playback-processor');
-  playbackNode.connect(playbackCtx.destination);
+    var audioB64 = await blobToBase64_(blob);
+    var resp = await fetch(RETURN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids a CORS preflight against Apps Script
+      body: JSON.stringify({ action: 'liveVoiceLookup', session: SESSION_TOKEN, audio: audioB64, mimeType: mimeType })
+    });
+    var result = await resp.json();
+    if (!result || result.ok === false) {
+      showError((result && result.error) || 'Something went wrong understanding that \u2014 try again.');
+      resetToReady_();
+      return;
+    }
+    if (result.question) addTranscriptLine('user', result.question); // Groq fallback returns the transcript; Gemini's combined call doesn't expose one separately
+    addTranscriptLine('secretary', result.answer);
+    await speakAnswer_(result.answer);
+  } catch (e) {
+    showError('Something went wrong: ' + e.message);
+    resetToReady_();
+  }
 }
 
-function playAudioChunk(base64Audio) {
-  if (!playbackNode) return;
-  if (playbackCtx.state === 'suspended') playbackCtx.resume();
-  var float32 = base64ToFloat32(base64Audio);
-  playbackNode.port.postMessage(float32);
+async function speakAnswer_(text) {
+  setStatus('Speaking…', '', 'speaking');
+  // Tier 1: Kokoro, 100% in-browser, no network call at all if it works. See the module script
+  // above — window.__tryKokoroSpeak_ returns false for any reason (not loaded, WebGPU/WASM
+  // unsupported, generation failed), and everything below runs exactly as it did before tonight.
+  try {
+    if (window.__tryKokoroSpeak_ && await window.__tryKokoroSpeak_(text)) {
+      resetToReady_();
+      return;
+    }
+  } catch (e) { /* falls through to tier 2 below regardless of what went wrong */ }
+  try {
+    var resp = await fetch(RETURN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'liveVoiceSpeak', session: SESSION_TOKEN, text: text })
+    });
+    var result = await resp.json();
+    if (!result || result.ok === false) {
+      // Voice synthesis failing shouldn't hide the answer that's already in the transcript above —
+      // just skip audio playback rather than showing an error over a question that actually succeeded.
+      resetToReady_();
+      return;
+    }
+    // 2026-08-04: ElevenLabs' free quota is small (~10,000 characters/month) and this signal fires
+    // once it's spent, or if ElevenLabs isn't configured at all — falls back to the browser's own
+    // free, unlimited SpeechSynthesis rather than failing. Flatter voice, but never silent.
+    if (result.useBrowserTTS) {
+      speakWithBrowserTTS_(result.text || text);
+      return;
+    }
+    var audio = new Audio('data:' + (result.mimeType || 'audio/mpeg') + ';base64,' + result.audio);
+    audio.onended = resetToReady_;
+    audio.onerror = resetToReady_;
+    await audio.play();
+  } catch (e) {
+    resetToReady_();
+  }
 }
 
-function endSession() {
-  sessionActive = false;
-  if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
-  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
-  if (captureCtx) { try { captureCtx.close(); } catch (e) {} captureCtx = null; captureNode = null; }
-  if (playbackCtx) { try { playbackCtx.close(); } catch (e) {} playbackCtx = null; playbackNode = null; }
-  document.getElementById('mainBtn').textContent = 'Start Conversation';
-  document.getElementById('mainBtn').className = 'btn btn-start';
+function speakWithBrowserTTS_(text) {
+  if (!('speechSynthesis' in window)) { resetToReady_(); return; } // very old/unsupported browser — silently skip rather than error over a question that already succeeded
+  try {
+    window.speechSynthesis.cancel(); // clears any stuck queued utterance from a previous turn before starting a new one
+    var utter = new SpeechSynthesisUtterance(text);
+    utter.rate = 1.0;
+    utter.onend = resetToReady_;
+    utter.onerror = resetToReady_;
+    window.speechSynthesis.speak(utter);
+  } catch (e) {
+    resetToReady_();
+  }
+}
+
+function resetToReady_() {
+  isBusy = false;
   document.getElementById('mainBtn').disabled = false;
-  if (!document.getElementById('errorBox').style.display || document.getElementById('errorBox').style.display === 'none') {
-    setStatus('Ready', 'Tap to start a live conversation', null);
+  if (document.getElementById('errorBox').style.display !== 'block') {
+    setStatus('Ready', 'Tap to ask a question', null);
   }
 }
 
 function endConversationAndReturn() {
-  // 2026-07-27 FINAL: every attempt at automated return — window.close(), direct navigation, a
-  // delayed navigation, a stripped-down pre-navigation cleanup — has either failed outright or made
-  // things worse (the WebKit crash-reload, the mic prompt reappearing on its own). That pattern
-  // means the attempt itself is very likely the problem, on this specific device, not any particular
-  // implementation of it. Stopping here: no navigation attempt of any kind. Just stop the session
-  // immediately and tell you clearly to switch tabs — nothing else running afterward that could
-  // trigger a side effect.
-  sessionActive = false;
-  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  // Same reasoning as before: no automated navigation attempt of any kind on this device — just stop
+  // cleanly and tell the person to switch tabs themselves.
+  try { if (mediaRecorder && isRecording) mediaRecorder.stop(); } catch (e) {}
   if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} micStream = null; }
-  var btn = document.getElementById('mainBtn');
-  if (btn) { btn.textContent = 'Start Conversation'; btn.className = 'btn btn-start'; }
   setStatus('Conversation ended', 'Switch to your SurgiLog tab now (swipe up, or your open-tabs button) \u2014 it was never closed', null);
 }
 
-window.addEventListener('beforeunload', function() { if (sessionActive) endSession(); });
+window.addEventListener('beforeunload', function() {
+  if (micStream) { try { micStream.getTracks().forEach(function(t){ t.stop(); }); } catch (e) {} }
+});
 
-// 2026-07-26: auto-start the instant this page loads, so opening it from SurgiLog is the ONE tap —
-// matching how Claude's own Voice Mode works (tap once, immediately listening), not a wake word
-// (which nothing web-based can do — see the chat this came from). If the browser blocks the
-// auto-triggered microphone request (iOS can be strict about requiring a direct tap on THIS page,
-// not just the one that opened it), startSession() already falls back gracefully to a normal
-// tappable "Start Conversation" button via its own existing error handling — never a stuck page.
-if (LIVE_TOKEN) {
-  startSession();
+if (!SESSION_TOKEN || !RETURN_URL) {
+  setStatus('Ready', 'No session found — open this page from the SurgiLog Secretary, not directly.', null);
+  document.getElementById('mainBtn').disabled = true;
 } else {
-  setStatus('Ready', 'No voice token found — open this page from the SurgiLog Secretary, not directly.', null);
+  // 2026-08-04: greeting-on-load, now text-only in the transcript rather than spoken — more discreet
+  // to open on a ward without audio firing immediately. Still costs nothing (no AI call, no TTS call).
+  addTranscriptLine('secretary', "Hi, I'm the Secretary — what can I help with?");
 }
 </script>
 </body>
