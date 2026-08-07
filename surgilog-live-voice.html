@@ -288,8 +288,19 @@ async function speakAnswer_(text) {
   // Tier 1: Kokoro, 100% in-browser, no network call at all if it works. See the module script
   // above — window.__tryKokoroSpeak_ returns false for any reason (not loaded, WebGPU/WASM
   // unsupported, generation failed), and everything below runs exactly as it did before tonight.
+  // 2026-08-07 FIX: this had no timeout, so if Kokoro's model load or generation ever hung instead of
+  // throwing (a real risk — untested ML pipeline, first-run model download, iOS WebGPU/WASM maturity),
+  // the whole chain waited forever and got stuck on "Speaking..." with no audio, confirmed by real
+  // testing. An 8-second cap means Kokoro is only ever tried while it's fast; anything slower falls
+  // straight through to Fish Audio/ElevenLabs/browser TTS instead of hanging the page.
   try {
-    if (window.__tryKokoroSpeak_ && await window.__tryKokoroSpeak_(text)) {
+    var kokoroResult = window.__tryKokoroSpeak_
+      ? await Promise.race([
+          window.__tryKokoroSpeak_(text),
+          new Promise(function(resolve) { setTimeout(function() { resolve(false); }, 8000); })
+        ])
+      : false;
+    if (kokoroResult) {
       resetToReady_();
       return;
     }
