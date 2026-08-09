@@ -82,22 +82,14 @@
 <script>
 // Real counters instead of guessing — shows exactly which stage of the pipeline is actually
 // running: mic capturing, chunks reaching the server, and anything at all coming back.
-var debugStats = { chunksSent: 0, bytesSent: 0, messagesReceived: 0, lastMessageType: 'none', wsState: '-',
-  // 2026-08-09 DIAGNOSTIC: lastMessageType only ever showed the MOST RECENT message, so anything
-  // that happened earlier in the session (a toolCall, grounding metadata) was invisible by the time
-  // you actually looked at the screen. seenTypes accumulates every distinct top-level key seen for
-  // the whole session instead, so a one-off event isn't lost.
-  seenTypes: {}, groundingSeen: false, toolCallSeen: false };
+var debugStats = { chunksSent: 0, bytesSent: 0, messagesReceived: 0, lastMessageType: 'none', wsState: '-' };
 function renderDebug() {
   document.getElementById('debugPanel').style.display = 'block';
   document.getElementById('debugBody').innerHTML =
     'WebSocket state: ' + debugStats.wsState + '<br>' +
     'Audio chunks sent: ' + debugStats.chunksSent + ' (' + debugStats.bytesSent + ' bytes total)<br>' +
     'Messages received from server: ' + debugStats.messagesReceived + '<br>' +
-    'Last message type: ' + debugStats.lastMessageType + '<br>' +
-    'All message types this session: ' + (Object.keys(debugStats.seenTypes).join(', ') || 'none yet') + '<br>' +
-    'toolCall ever seen: ' + debugStats.toolCallSeen + '<br>' +
-    'groundingMetadata ever seen: ' + debugStats.groundingSeen;
+    'Last message type: ' + debugStats.lastMessageType;
 }
 
 // ---------- Config passed in from SurgiLog ----------
@@ -115,7 +107,6 @@ var sessionActive = false;
 var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
 var wakeLock = null; // keeps the screen from auto-locking during an active conversation — best-effort only
 var currentUserLine = "", currentSecretaryLine = "";
-var lastServerError = null; // 2026-08-09 DIAGNOSTIC: captured from a response.error data frame, if any arrives before the close frame — see onclose below, which otherwise overwrites it with a generic "closed" message before it can be read
 
 function setStatus(text, sub, mode) {
   document.getElementById('status').textContent = text;
@@ -224,7 +215,6 @@ function toggleSession() {
 async function startSession() {
   clearError();
   isAiSpeaking = false;
-  lastServerError = null;
   if (!LIVE_TOKEN) { showError('No voice token was passed in. Open this page from the SurgiLog Secretary, not directly.'); return; }
   document.getElementById('mainBtn').disabled = true;
   setStatus('Connecting…', 'Setting up microphone and connection', null);
@@ -262,19 +252,11 @@ async function startSession() {
     // reference (unlike the token endpoint's liveConnectConstraints, which genuinely doesn't exist)
     // — left out for now on purpose, to isolate whether this structural fix alone gets the core
     // connection working before adding anything back.
-    // 2026-08-09 DIAGNOSTIC (temporary, not a shipped feature): googleSearch was previously pulled
-    // out entirely after triggering a 1011 close. Putting it back, alone, with no other change, so a
-    // real close reason can be read off ws.onclose below (it already surfaces event.reason on
-    // screen) — the goal is just to see whether Google's own text says quota/RESOURCE_EXHAUSTED or
-    // something else, before building any bigger fix around an unconfirmed cause. Remove this block
-    // (or wire it up properly with executableCode/codeExecutionResult handling in
-    // handleServerMessage) once that's known — do not ship this as-is.
     var setupMessage = {
       setup: {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        tools: [{ googleSearch: {} }]
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
       }
     };
     ws.send(JSON.stringify(setupMessage));
@@ -320,19 +302,12 @@ async function startSession() {
     }
     debugStats.messagesReceived++;
     debugStats.lastMessageType = Object.keys(response).join(',') || 'empty';
-    debugStats.lastMessageType.split(',').forEach(function(k){ if (k) debugStats.seenTypes[k] = true; });
-    if (response.toolCall) debugStats.toolCallSeen = true;
     renderDebug();
     if (response.setupComplete) return;
     if (response.serverContent) {
       var sc = response.serverContent;
-      // 2026-08-09 DIAGNOSTIC: groundingMetadata's exact location in the Live API's serverContent
-      // shape isn't confirmed from docs alone, so checking both plausible spots — a sibling of
-      // modelTurn (matching how inputTranscription/outputTranscription sit) and per-part.
-      if (sc.groundingMetadata) debugStats.groundingSeen = true;
       if (sc.modelTurn && sc.modelTurn.parts) {
         sc.modelTurn.parts.forEach(function(part) {
-          if (part.groundingMetadata) debugStats.groundingSeen = true;
           if (part.inlineData && part.inlineData.data) {
             // 2026-07-27 FIX: browser echoCancellation is only a best-effort hint, and it doesn't
             // reliably track audio played back through the raw Web Audio API the way it tracks a
@@ -367,8 +342,7 @@ async function startSession() {
       }
     }
     if (response.error) {
-      lastServerError = response.error.message || JSON.stringify(response.error);
-      showError('Voice service error: ' + lastServerError);
+      showError('Voice service error: ' + (response.error.message || JSON.stringify(response.error)));
     }
   };
 
@@ -384,11 +358,7 @@ async function startSession() {
     // actually see WHY it closed (e.g. code 1008 usually means the server rejected something in the
     // setup message) rather than guessing blind.
     if (sessionActive) {
-      // 2026-08-09 DIAGNOSTIC: prefer a real error message from a data frame (lastServerError) over
-      // the close frame's own reason, which Gemini frequently leaves empty even on a quota/internal
-      // failure — falling straight to the generic "closed" text was silently discarding whatever
-      // detail did arrive.
-      var reason = event.reason || lastServerError || '';
+      var reason = event.reason || '';
       var friendly = (reason.indexOf('used too many times') >= 0)
         ? 'This voice link has been used up. Go back to SurgiLog and tap "Live Voice Conversation" again for a fresh one.'
         : 'Voice session closed (code ' + event.code + (reason ? ': ' + reason : '') + '). If this keeps happening, go back to SurgiLog and tap "Live Voice Conversation" again for a fresh token.';
