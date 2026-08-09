@@ -107,6 +107,7 @@ var sessionActive = false;
 var isAiSpeaking = false; // true while the Secretary's own voice is playing — gates outgoing mic audio to prevent it hearing itself
 var wakeLock = null; // keeps the screen from auto-locking during an active conversation — best-effort only
 var currentUserLine = "", currentSecretaryLine = "";
+var lastServerError = null; // 2026-08-09 DIAGNOSTIC: captured from a response.error data frame, if any arrives before the close frame — see onclose below, which otherwise overwrites it with a generic "closed" message before it can be read
 
 function setStatus(text, sub, mode) {
   document.getElementById('status').textContent = text;
@@ -215,6 +216,7 @@ function toggleSession() {
 async function startSession() {
   clearError();
   isAiSpeaking = false;
+  lastServerError = null;
   if (!LIVE_TOKEN) { showError('No voice token was passed in. Open this page from the SurgiLog Secretary, not directly.'); return; }
   document.getElementById('mainBtn').disabled = true;
   setStatus('Connecting…', 'Setting up microphone and connection', null);
@@ -252,20 +254,18 @@ async function startSession() {
     // reference (unlike the token endpoint's liveConnectConstraints, which genuinely doesn't exist)
     // — left out for now on purpose, to isolate whether this structural fix alone gets the core
     // connection working before adding anything back.
-    // 2026-08-07: TWO surgical fixes on top of the working v4.08 baseline, nothing else touched —
-    // this is deliberately NOT a rebuild, just closing the actual gap (stale 2021-era answers):
-    //   1. tools: googleSearch — was missing entirely, so the model had no live search access at all,
-    //      answering purely from training data. Same field the typed-chat path already uses.
-    //   2. Today's real date, read from the device's own clock and prepended to the system prompt —
-    //      staff are physically in Mauritius on their own phones, so the device clock is already
-    //      correct local time; no server round-trip needed for this.
-    var todayStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    var promptWithDate = "Today's real date is " + todayStr + " — treat this as ground truth. " + SYSTEM_PROMPT;
+    // 2026-08-09 DIAGNOSTIC (temporary, not a shipped feature): googleSearch was previously pulled
+    // out entirely after triggering a 1011 close. Putting it back, alone, with no other change, so a
+    // real close reason can be read off ws.onclose below (it already surfaces event.reason on
+    // screen) — the goal is just to see whether Google's own text says quota/RESOURCE_EXHAUSTED or
+    // something else, before building any bigger fix around an unconfirmed cause. Remove this block
+    // (or wire it up properly with executableCode/codeExecutionResult handling in
+    // handleServerMessage) once that's known — do not ship this as-is.
     var setupMessage = {
       setup: {
         model: 'models/' + MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: promptWithDate }] },
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         tools: [{ googleSearch: {} }]
       }
     };
@@ -352,7 +352,8 @@ async function startSession() {
       }
     }
     if (response.error) {
-      showError('Voice service error: ' + (response.error.message || JSON.stringify(response.error)));
+      lastServerError = response.error.message || JSON.stringify(response.error);
+      showError('Voice service error: ' + lastServerError);
     }
   };
 
@@ -368,7 +369,11 @@ async function startSession() {
     // actually see WHY it closed (e.g. code 1008 usually means the server rejected something in the
     // setup message) rather than guessing blind.
     if (sessionActive) {
-      var reason = event.reason || '';
+      // 2026-08-09 DIAGNOSTIC: prefer a real error message from a data frame (lastServerError) over
+      // the close frame's own reason, which Gemini frequently leaves empty even on a quota/internal
+      // failure — falling straight to the generic "closed" text was silently discarding whatever
+      // detail did arrive.
+      var reason = event.reason || lastServerError || '';
       var friendly = (reason.indexOf('used too many times') >= 0)
         ? 'This voice link has been used up. Go back to SurgiLog and tap "Live Voice Conversation" again for a fresh one.'
         : 'Voice session closed (code ' + event.code + (reason ? ': ' + reason : '') + '). If this keeps happening, go back to SurgiLog and tap "Live Voice Conversation" again for a fresh token.';
